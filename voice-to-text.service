@@ -1,0 +1,15 @@
+[Unit]
+Description=Local Voice-to-Text daemon
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/share/voice-to-text/venv/bin/python %h/.local/share/voice-to-text/app.py daemon
+Restart=on-failure
+RestartSec=2
+Environment=VTT_MODEL=small
+Environment=VTT_LANGUAGE=auto
+Environment=VTT_COMPUTE_TYPE=int8
+
+[Install]
+WantedBy=default.target
