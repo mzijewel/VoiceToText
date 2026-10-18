@@ -76,7 +76,7 @@ Edit `~/.config/systemd/user/voice-to-text.service`, then run `systemctl --user 
 - `VTT_LANGUAGE=auto` lets Whisper detect language; use `bn` for Bangla or `en` for English.
 - `VTT_COMPUTE_TYPE=int8` is intended for CPU inference.
 
-The simple silence detector is energy-based. In a noisy room, adjust `SILENCE_RMS` in `app.py` (higher = less sensitive to background noise). If it stops too early, increase `SILENCE_SECONDS`.
+Recording only stops when you run `toggle` a second time; there is no automatic silence detection.
 
 ## Troubleshooting
 

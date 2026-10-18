@@ -21,8 +21,6 @@ SOCKET_PATH = Path(os.environ.get("XDG_RUNTIME_DIR", f"/tmp/voice-to-text-{os.ge
 SAMPLE_RATE = 16000
 CHANNELS = 1
 BLOCK_SECONDS = 0.25
-SILENCE_SECONDS = 2.0
-SILENCE_RMS = 0.012  # Raise this if room noise prevents silence detection.
 MODEL_NAME = os.environ.get("VTT_MODEL", "small")
 LANGUAGE = os.environ.get("VTT_LANGUAGE", "auto")  # auto, en, bn
 COMPUTE_TYPE = os.environ.get("VTT_COMPUTE_TYPE", "int8")
@@ -87,8 +85,6 @@ class VoiceToTextDaemon:
         try:
             notify("Recording… speak now. Press the shortcut to finish.")
             chunks: list[np.ndarray] = []
-            silence_for = 0.0
-            speech_seen = False
             blocksize = int(SAMPLE_RATE * BLOCK_SECONDS)
 
             with sd.InputStream(
@@ -104,14 +100,6 @@ class VoiceToTextDaemon:
                         print("Warning: microphone input overflow", file=sys.stderr)
                     mono = np.asarray(data, dtype=np.float32).reshape(-1)
                     chunks.append(mono.copy())
-                    rms = float(np.sqrt(np.mean(np.square(mono)) + 1e-12))
-                    if rms >= SILENCE_RMS:
-                        speech_seen = True
-                        silence_for = 0.0
-                    elif speech_seen:
-                        silence_for += BLOCK_SECONDS
-                        if silence_for >= SILENCE_SECONDS:
-                            break
 
             if not chunks:
                 notify("No audio recorded.")
