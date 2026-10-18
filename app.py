@@ -40,14 +40,18 @@ def pick_input_device() -> int | str | None:
     return None
 
 
-def notify(message: str) -> None:
+def notify(message: str, *, popup: bool = False) -> None:
+    """Log a status message; only show a desktop popup for problems the overlay can't show."""
+    print(message, flush=True)
+    if not popup:
+        return
     try:
         subprocess.Popen(
             ["notify-send", "--app-name=Voice to Text", "Voice to Text", message],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
     except FileNotFoundError:
-        print(message, flush=True)
+        pass
 
 
 def run_cmd(args: list[str], *, input_text: str | None = None, timeout: float = 5) -> subprocess.CompletedProcess:
@@ -106,7 +110,7 @@ class VoiceToTextDaemon:
 
     def record_and_transcribe(self) -> None:
         try:
-            notify("Recording… speak now. Press the shortcut to finish.")
+            # notify("Recording… speak now. Press the shortcut to finish.")
             chunks: list[np.ndarray] = []
             blocksize = int(SAMPLE_RATE * BLOCK_SECONDS)
 
@@ -127,16 +131,16 @@ class VoiceToTextDaemon:
                     self.write_state("recording", min(1.0, (rms ** 0.5) * 2.5))
 
             if self.cancelled:
-                notify("Recording cancelled.")
+                # notify("Recording cancelled.")
                 return
 
             if not chunks:
-                notify("No audio recorded.")
+                # notify("No audio recorded.")
                 return
 
             audio = np.concatenate(chunks)
             if len(audio) < int(0.25 * SAMPLE_RATE):
-                notify("Recording was too short.")
+                # notify("Recording was too short.")
                 return
 
             wav_path = APP_DIR / f"recording-{int(time.time())}.wav"
@@ -150,7 +154,7 @@ class VoiceToTextDaemon:
                 wf.writeframes(pcm16.tobytes())
 
             self.write_state("processing")
-            notify("Transcribing locally…")
+            # notify("Transcribing locally…")
             processing_start = time.perf_counter()
             model = self.load_model()
             load_seconds = time.perf_counter() - processing_start
@@ -166,7 +170,7 @@ class VoiceToTextDaemon:
             text = "".join(seg.text for seg in segments).strip()
             transcribe_seconds = time.perf_counter() - transcribe_start
             if not text:
-                notify("No speech recognized.")
+                # notify("No speech recognized.")
                 return
 
             # Put recognized text on the Wayland clipboard.
@@ -185,11 +189,11 @@ class VoiceToTextDaemon:
             time.sleep(0.25)
             paste = run_cmd(["wtype", "-M", "ctrl", "-P", "v", "-p", "v", "-m", "ctrl"], timeout=5)
             if paste.returncode != 0:
-                notify("Text copied, but auto-paste failed. Paste with Ctrl+V.")
+                # notify("Text copied, but auto-paste failed. Paste with Ctrl+V.", popup=True)
                 print(paste.stderr, file=sys.stderr)
             else:
                 detected = getattr(info, "language", "unknown")
-                notify(f"Inserted text ({detected}): {text[:100]}")
+                # notify(f"Inserted text ({detected}): {text[:100]}")
             total_seconds = time.perf_counter() - processing_start
             print(
                 f"\nTranscription: {text}\n"
@@ -198,7 +202,7 @@ class VoiceToTextDaemon:
                 flush=True,
             )
         except Exception as exc:
-            notify(f"Error: {exc}")
+            # notify(f"Error: {exc}", popup=True)
             print(f"voice-to-text error: {exc}", file=sys.stderr, flush=True)
         finally:
             with self.lock:
