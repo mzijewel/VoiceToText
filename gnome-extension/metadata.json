@@ -1,0 +1,7 @@
+{
+  "uuid": "voice-to-text-overlay@local",
+  "name": "Voice to Text Overlay",
+  "description": "Floating pill showing recording level and processing state for the local voice-to-text daemon.",
+  "shell-version": ["46", "47", "48", "49", "50"],
+  "version": 1
+}

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import queue
 import socket
@@ -17,10 +18,12 @@ import sounddevice as sd
 from faster_whisper import WhisperModel
 
 APP_DIR = Path.home() / ".local" / "share" / "voice-to-text"
-SOCKET_PATH = Path(os.environ.get("XDG_RUNTIME_DIR", f"/tmp/voice-to-text-{os.getuid()}")) / "voice-to-text.sock"
+RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", f"/tmp/voice-to-text-{os.getuid()}"))
+SOCKET_PATH = RUNTIME_DIR / "voice-to-text.sock"
+STATE_PATH = RUNTIME_DIR / "voice-to-text.state"  # read by the GNOME Shell overlay
 SAMPLE_RATE = 16000
 CHANNELS = 1
-BLOCK_SECONDS = 0.25
+BLOCK_SECONDS = 0.05
 MODEL_NAME = os.environ.get("VTT_MODEL", "small")
 LANGUAGE = os.environ.get("VTT_LANGUAGE", "auto")  # auto, en, bn
 COMPUTE_TYPE = os.environ.get("VTT_COMPUTE_TYPE", "int8")
@@ -63,6 +66,25 @@ class VoiceToTextDaemon:
         self.stop_event = threading.Event()
         self.worker: threading.Thread | None = None
         self.server: socket.socket | None = None
+        self.cancelled = False
+        self.write_state("idle")
+
+    def write_state(self, state: str, level: float = 0.0) -> None:
+        """Publish state for the on-screen overlay (atomic replace so readers never see partial JSON)."""
+        tmp = STATE_PATH.with_suffix(".tmp")
+        try:
+            tmp.write_text(json.dumps({"state": state, "level": round(level, 3), "ts": time.time()}))
+            os.replace(tmp, STATE_PATH)
+        except OSError as exc:
+            print(f"Could not write state file: {exc}", file=sys.stderr)
+
+    def cancel(self) -> str:
+        with self.lock:
+            if not self.recording:
+                return "Nothing to cancel."
+            self.cancelled = True
+            self.stop_event.set()
+            return "Cancelled."
 
     def load_model(self) -> WhisperModel:
         if self.model is None:
@@ -76,6 +98,7 @@ class VoiceToTextDaemon:
                 self.stop_event.set()
                 return "Stopping recording…"
             self.recording = True
+            self.cancelled = False
             self.stop_event = threading.Event()
             self.worker = threading.Thread(target=self.record_and_transcribe, daemon=True)
             self.worker.start()
@@ -100,6 +123,12 @@ class VoiceToTextDaemon:
                         print("Warning: microphone input overflow", file=sys.stderr)
                     mono = np.asarray(data, dtype=np.float32).reshape(-1)
                     chunks.append(mono.copy())
+                    rms = float(np.sqrt(np.mean(np.square(mono)) + 1e-12))
+                    self.write_state("recording", min(1.0, (rms ** 0.5) * 2.5))
+
+            if self.cancelled:
+                notify("Recording cancelled.")
+                return
 
             if not chunks:
                 notify("No audio recorded.")
@@ -120,6 +149,7 @@ class VoiceToTextDaemon:
                 wf.setframerate(SAMPLE_RATE)
                 wf.writeframes(pcm16.tobytes())
 
+            self.write_state("processing")
             notify("Transcribing locally…")
             processing_start = time.perf_counter()
             model = self.load_model()
@@ -174,6 +204,7 @@ class VoiceToTextDaemon:
             with self.lock:
                 self.recording = False
                 self.stop_event.clear()
+            self.write_state("idle")
 
     def serve(self) -> None:
         SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -193,13 +224,18 @@ class VoiceToTextDaemon:
                     command = conn.recv(128).decode("utf-8", "replace").strip()
                     if command == "toggle":
                         result = self.toggle()
+                    elif command == "cancel":
+                        result = self.cancel()
                     elif command == "status":
                         result = "recording" if self.recording else "idle"
                     else:
                         result = "unknown command"
                     conn.sendall(result.encode())
                 except Exception as exc:
-                    conn.sendall(f"error: {exc}".encode())
+                    try:
+                        conn.sendall(f"error: {exc}".encode())
+                    except OSError:
+                        pass  # client (e.g. the overlay) already hung up
 
 
 def send_command(command: str) -> str:
@@ -215,7 +251,7 @@ def send_command(command: str) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Local Wayland voice-to-text")
-    parser.add_argument("command", choices=["daemon", "toggle", "status"])
+    parser.add_argument("command", choices=["daemon", "toggle", "cancel", "status"])
     args = parser.parse_args()
     if args.command == "daemon":
         VoiceToTextDaemon().serve()
