@@ -133,7 +133,10 @@ class VoiceToTextDaemon:
                 wf.writeframes(pcm16.tobytes())
 
             notify("Transcribing locally…")
+            processing_start = time.perf_counter()
             model = self.load_model()
+            load_seconds = time.perf_counter() - processing_start
+            transcribe_start = time.perf_counter()
             lang = None if LANGUAGE.lower() == "auto" else LANGUAGE.lower()
             segments, info = model.transcribe(
                 audio,  # pass the array; avoids PyAV file decoding
@@ -143,6 +146,7 @@ class VoiceToTextDaemon:
                 condition_on_previous_text=False,
             )
             text = "".join(seg.text for seg in segments).strip()
+            transcribe_seconds = time.perf_counter() - transcribe_start
             if not text:
                 notify("No speech recognized.")
                 return
@@ -168,7 +172,13 @@ class VoiceToTextDaemon:
             else:
                 detected = getattr(info, "language", "unknown")
                 notify(f"Inserted text ({detected}): {text[:100]}")
-            print(f"\nTranscription: {text}\n", flush=True)
+            total_seconds = time.perf_counter() - processing_start
+            print(
+                f"\nTranscription: {text}\n"
+                f"Timing: audio {len(audio) / SAMPLE_RATE:.1f}s | model load {load_seconds:.2f}s | "
+                f"transcribe {transcribe_seconds:.2f}s | total after recording {total_seconds:.2f}s\n",
+                flush=True,
+            )
         except Exception as exc:
             notify(f"Error: {exc}")
             print(f"voice-to-text error: {exc}", file=sys.stderr, flush=True)
