@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import queue
@@ -253,6 +254,35 @@ def send_command(command: str) -> str:
         client.close()
 
 
+def start_daemon(timeout: float = 30) -> None:
+    """Spawn a detached daemon and wait until its socket accepts connections."""
+    lock_path = RUNTIME_DIR / "voice-to-text.lock"
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)  # a second key press waits here instead of spawning another daemon
+        try:
+            send_command("status")
+            return  # someone else started it while we waited for the lock
+        except OSError:
+            pass
+        APP_DIR.mkdir(parents=True, exist_ok=True)
+        with open(APP_DIR / "daemon.log", "ab") as log:
+            proc = subprocess.Popen(
+                [sys.executable, str(Path(__file__).resolve()), "daemon"],
+                stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
+            )
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                send_command("status")
+                return
+            except OSError:
+                if proc.poll() is not None:
+                    raise OSError(f"daemon exited on startup (see {APP_DIR / 'daemon.log'})") from None
+                time.sleep(0.1)
+        raise TimeoutError(f"daemon did not start within {timeout:.0f}s (see {APP_DIR / 'daemon.log'})")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Local Wayland voice-to-text")
     parser.add_argument("command", choices=["daemon", "toggle", "cancel", "status"])
@@ -261,9 +291,15 @@ def main() -> int:
         VoiceToTextDaemon().serve()
         return 0
     try:
-        print(send_command(args.command))
+        try:
+            print(send_command(args.command))
+        except OSError:
+            if args.command != "toggle":
+                raise
+            start_daemon()
+            print(send_command(args.command))
         return 0
-    except (OSError, socket.timeout) as exc:
+    except OSError as exc:
         print(f"Voice-to-Text daemon is not running: {exc}", file=sys.stderr)
         print("Start it with: systemctl --user start voice-to-text.service", file=sys.stderr)
         return 1
