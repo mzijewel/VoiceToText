@@ -30,17 +30,82 @@ SAMPLE_RATE = 16000
 CHANNELS = 1
 BLOCK_SECONDS = 0.05
 LEVEL_LOG_SECONDS = 1.0  # how often to log a mic level summary while recording
-MODEL_NAME = os.environ.get("VTT_MODEL", "small")
-LANGUAGE = os.environ.get("VTT_LANGUAGE", "auto")  # auto, en, bn
-COMPUTE_TYPE = os.environ.get("VTT_COMPUTE_TYPE", "int8")
-LOG_LEVEL = os.environ.get("VTT_LOG_LEVEL", "DEBUG").upper()
+CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "voice-to-text" / "config.json"
+# name -> (env var, default, allowed values or None for free-form)
+SETTING_SPECS: dict[str, tuple[str, str, tuple[str, ...] | None]] = {
+    "model": ("VTT_MODEL", "small", ("tiny", "base", "small", "medium", "large-v3", "turbo")),
+    "language": ("VTT_LANGUAGE", "auto", ("auto", "en", "bn")),
+    "compute_type": ("VTT_COMPUTE_TYPE", "int8", ("int8", "int8_float32", "int16", "float32")),
+    "device": ("VTT_DEVICE", "auto", None),  # input device index or name; see `app.py devices`
+    "log_level": ("VTT_LOG_LEVEL", "DEBUG", ("DEBUG", "INFO", "WARNING", "ERROR")),
+}
 
 log = logging.getLogger("voice-to-text")
 
 
+def read_config_file() -> dict[str, str]:
+    try:
+        data = json.loads(CONFIG_PATH.read_text())
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        log.warning("Ignoring unreadable config %s: %s", CONFIG_PATH, exc)
+        return {}
+    return {k: str(v) for k, v in data.items() if k in SETTING_SPECS}
+
+
+def load_settings() -> tuple[dict[str, str], dict[str, str]]:
+    """Resolve settings as config file > env var > default; returns (values, source of each value)."""
+    values: dict[str, str] = {}
+    sources: dict[str, str] = {}
+    saved = read_config_file()
+    for name, (env, default, _) in SETTING_SPECS.items():
+        if name in saved:
+            values[name], sources[name] = saved[name], "config file"
+        elif os.environ.get(env):
+            values[name], sources[name] = os.environ[env], f"env {env}"
+        else:
+            values[name], sources[name] = default, "default"
+    values["log_level"] = values["log_level"].upper()
+    return values, sources
+
+
+SETTINGS, SETTING_SOURCES = load_settings()
+
+
+def save_setting(name: str, value: str | None) -> None:
+    """Persist (or with None, remove) one setting in the config file."""
+    saved = read_config_file()
+    if value is None:
+        saved.pop(name, None)
+    else:
+        saved[name] = value
+    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(saved, indent=2) + "\n")
+    tmp.replace(CONFIG_PATH)
+
+
+def format_settings(extra: dict[str, str] | None = None) -> str:
+    lines = []
+    for name, (_, _, choices) in SETTING_SPECS.items():
+        hint = f"  [{' | '.join(choices)}]" if choices else ""
+        lines.append(f"{name:<13} {SETTINGS[name]:<10} ({SETTING_SOURCES[name]}){hint}")
+    for key, value in (extra or {}).items():
+        lines.append(f"{key:<13} {value}")
+    lines.append(f"config file   {CONFIG_PATH}")
+    return "\n".join(lines)
+
+
+def apply_log_level() -> None:
+    level = getattr(logging, SETTINGS["log_level"], logging.DEBUG)
+    for name in ("voice-to-text", "faster_whisper"):
+        logging.getLogger(name).setLevel(level)
+
+
 def setup_logging(role: str) -> None:
     """Log to a rotating file shared by daemon and clients, plus stderr for interactive/systemd runs."""
-    level = getattr(logging, LOG_LEVEL, logging.DEBUG)
+    level = getattr(logging, SETTINGS["log_level"], logging.DEBUG)
     fmt = logging.Formatter(
         f"%(asctime)s.%(msecs)03d %(levelname)-7s [{role} pid=%(process)d %(threadName)s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
@@ -78,9 +143,9 @@ def pick_input_device() -> int | str | None:
     sd._terminate()
     sd._initialize()
     log.debug("Re-initialized PortAudio in %.3fs", time.perf_counter() - start)
-    override = os.environ.get("VTT_DEVICE")
-    if override:
-        log.info("Using input device from VTT_DEVICE: %r", override)
+    override = SETTINGS["device"]
+    if override != "auto":
+        log.info("Using configured input device: %r", override)
         return int(override) if override.isdigit() else override
     devices = sd.query_devices()
     for index, dev in enumerate(devices):
@@ -128,6 +193,8 @@ class VoiceToTextDaemon:
     def __init__(self) -> None:
         APP_DIR.mkdir(parents=True, exist_ok=True)
         self.model: WhisperModel | None = None
+        self.model_key: tuple[str, str] | None = None  # (model, compute_type) the cached model was built with
+        self.input_device = "not used yet"
         self.lock = threading.Lock()
         self.recording = False
         self.stop_event = threading.Event()
@@ -165,15 +232,27 @@ class VoiceToTextDaemon:
             return "Cancelled."
 
     def load_model(self) -> WhisperModel:
-        if self.model is None:
-            self.write_state("processing", message=f"Loading {MODEL_NAME} model…")
-            notify(f"Loading local Whisper model: {MODEL_NAME} (device=cpu, compute_type={COMPUTE_TYPE})")
+        wanted = (SETTINGS["model"], SETTINGS["compute_type"])
+        if self.model is None or self.model_key != wanted:
+            model_name, compute_type = wanted
+            self.write_state("processing", message=f"Loading {model_name} model…")
+            notify(f"Loading local Whisper model: {model_name} (device=cpu, compute_type={compute_type})")
             start = time.perf_counter()
-            self.model = WhisperModel(MODEL_NAME, device="cpu", compute_type=COMPUTE_TYPE)
-            log.info("Model %s loaded in %.2fs", MODEL_NAME, time.perf_counter() - start)
+            self.model = WhisperModel(model_name, device="cpu", compute_type=compute_type)
+            self.model_key = wanted
+            log.info("Model %s loaded in %.2fs", model_name, time.perf_counter() - start)
         else:
-            log.debug("Using cached model %s", MODEL_NAME)
+            log.debug("Using cached model %s", wanted[0])
         return self.model
+
+    def reload_settings(self) -> str:
+        global SETTINGS, SETTING_SOURCES
+        old = SETTINGS
+        SETTINGS, SETTING_SOURCES = load_settings()
+        apply_log_level()
+        changed = {k: (old[k], v) for k, v in SETTINGS.items() if old[k] != v}
+        log.info("Settings reloaded; changed: %s", changed or "nothing")
+        return "Settings reloaded (model changes load on the next transcription)." if changed else "No changes."
 
     def toggle(self) -> str:
         with self.lock:
@@ -196,6 +275,7 @@ class VoiceToTextDaemon:
             chunks: list[np.ndarray] = []
             blocksize = int(SAMPLE_RATE * BLOCK_SECONDS)
             device = pick_input_device()
+            self.input_device = sd.query_devices(device, "input")["name"]
             overflows = 0
             window_peak = 0.0
             window_rms: list[float] = []
@@ -276,9 +356,9 @@ class VoiceToTextDaemon:
             model = self.load_model()
             load_seconds = time.perf_counter() - processing_start
             transcribe_start = time.perf_counter()
-            lang = None if LANGUAGE.lower() == "auto" else LANGUAGE.lower()
+            lang = None if SETTINGS["language"].lower() == "auto" else SETTINGS["language"].lower()
             self.write_state("processing", message="Transcribing…")
-            log.info("Transcribing: model=%s language=%s beam_size=5 vad_filter=True", MODEL_NAME, lang or "auto")
+            log.info("Transcribing: model=%s language=%s beam_size=5 vad_filter=True", SETTINGS["model"], lang or "auto")
             segments, info = model.transcribe(
                 audio,  # pass the array; avoids PyAV file decoding
                 language=lang,
@@ -353,8 +433,7 @@ class VoiceToTextDaemon:
 
     def serve(self) -> None:
         log.info("Daemon starting: python %s on %s, pid %d", platform.python_version(), platform.platform(), os.getpid())
-        log.info("Config: model=%s language=%s compute_type=%s device=%s log_level=%s",
-                 MODEL_NAME, LANGUAGE, COMPUTE_TYPE, os.environ.get("VTT_DEVICE", "auto"), LOG_LEVEL)
+        log.info("Config: %s", ", ".join(f"{k}={v} ({SETTING_SOURCES[k]})" for k, v in SETTINGS.items()))
         log.info("Paths: socket=%s state=%s app_dir=%s log=%s", SOCKET_PATH, STATE_PATH, APP_DIR, LOG_PATH)
         SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
         try:
@@ -378,6 +457,12 @@ class VoiceToTextDaemon:
                         result = self.cancel()
                     elif command == "status":
                         result = "recording" if self.recording else "idle"
+                    elif command == "settings":
+                        loaded = f"{self.model_key[0]} ({self.model_key[1]})" if self.model_key else "not loaded yet"
+                        result = format_settings({"loaded model": loaded, "last mic": self.input_device,
+                                                  "daemon pid": str(os.getpid())})
+                    elif command == "reload":
+                        result = self.reload_settings()
                     else:
                         log.warning("Unknown command %r", command)
                         result = "unknown command"
@@ -399,7 +484,10 @@ def send_command(command: str) -> str:
     try:
         client.connect(str(SOCKET_PATH))
         client.sendall(command.encode())
-        return client.recv(1024).decode("utf-8", "replace")
+        chunks = []
+        while chunk := client.recv(4096):
+            chunks.append(chunk)
+        return b"".join(chunks).decode("utf-8", "replace")
     finally:
         client.close()
 
@@ -440,11 +528,63 @@ def start_daemon(timeout: float = 30) -> None:
         raise TimeoutError(f"daemon did not start within {timeout:.0f}s (see {APP_DIR / 'daemon.log'})")
 
 
+def list_input_devices() -> str:
+    lines = [f"{'#':>3}  {'ch':>2}  name"]
+    for index, dev in enumerate(sd.query_devices()):
+        if dev["max_input_channels"] > 0:
+            lines.append(f"{index:>3}  {dev['max_input_channels']:>2}  {dev['name']}")
+    lines.append("\nUse a name with: app.py set device '<name>'  (indexes can change when devices are plugged in)")
+    return "\n".join(lines)
+
+
+def change_setting(name: str, value: str | None) -> int:
+    """`set`/`reset`: validate, persist, and tell a running daemon to reload."""
+    if name not in SETTING_SPECS:
+        print(f"Unknown setting {name!r}; choose from: {', '.join(SETTING_SPECS)}", file=sys.stderr)
+        return 2
+    choices = SETTING_SPECS[name][2]
+    if value is not None:
+        if name == "log_level":
+            value = value.upper()
+        if choices and value not in choices:
+            print(f"Invalid {name} {value!r}; choose from: {', '.join(choices)}", file=sys.stderr)
+            return 2
+    save_setting(name, value)
+    log.info("Setting %s %s", name, f"= {value!r}" if value is not None else "reset")
+    print(f"{name} = {value}" if value is not None else f"{name} reset (env var or default applies)")
+    try:
+        print(send_command("reload"))
+    except OSError:
+        print("Daemon not running; the setting applies when it starts.")
+    return 0
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Local Wayland voice-to-text")
-    parser.add_argument("command", choices=["daemon", "toggle", "cancel", "status"])
+    parser = argparse.ArgumentParser(
+        description="Local Wayland voice-to-text",
+        epilog="examples: app.py settings | app.py set language bn | app.py reset language | app.py devices",
+    )
+    parser.add_argument("command", choices=["daemon", "toggle", "cancel", "status", "settings", "set", "reset", "devices"])
+    parser.add_argument("args", nargs="*", help="set: NAME VALUE; reset: NAME")
     args = parser.parse_args()
     setup_logging(args.command)
+    if args.command == "set":
+        if len(args.args) != 2:
+            parser.error("usage: app.py set NAME VALUE")
+        return change_setting(*args.args)
+    if args.command == "reset":
+        if len(args.args) != 1:
+            parser.error("usage: app.py reset NAME")
+        return change_setting(args.args[0], None)
+    if args.command == "devices":
+        print(list_input_devices())
+        return 0
+    if args.command == "settings":
+        try:
+            print(send_command("settings"))
+        except OSError:
+            print(format_settings({"daemon": "not running (values as this shell would start it)"}))
+        return 0
     if args.command == "daemon":
         try:
             VoiceToTextDaemon().serve()

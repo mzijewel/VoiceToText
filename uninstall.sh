@@ -3,7 +3,7 @@
 # System packages are left installed since other software may use them.
 #
 # Usage: ./uninstall.sh [--purge]
-#   --purge  also delete saved recordings and the downloaded Whisper models
+#   --purge  also delete saved recordings, saved settings and the downloaded Whisper models
 set -euo pipefail
 
 INSTALL_DIR="$HOME/.local/share/voice-to-text"
@@ -48,6 +48,9 @@ if [[ -x "$SYSTEM_GSETTINGS" ]]; then
     done
 fi
 
+step "Removing 'vtt' alias from ~/.bashrc"
+[[ -f "$HOME/.bashrc" ]] && sed -i '/^# >>> voice-to-text >>>$/,/^# <<< voice-to-text <<<$/d' "$HOME/.bashrc"
+
 step "Removing overlay extension"
 if command -v gnome-extensions >/dev/null; then
     gnome-extensions disable "$UUID" 2>/dev/null || true
@@ -67,6 +70,7 @@ if (( PURGE )); then
     step "Removing downloaded Whisper models"
     HF_HUB="${HF_HOME:-$HOME/.cache/huggingface}/hub"
     rm -rf "$HF_HUB"/models--Systran--faster-whisper-*
+    rm -rf "${XDG_CONFIG_HOME:-$HOME/.config}/voice-to-text"  # settings saved by `vtt set`
 fi
 
 step "Done"

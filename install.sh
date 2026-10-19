@@ -78,6 +78,16 @@ else
     echo "  $VENV/bin/python $INSTALL_DIR/app.py toggle" >&2
 fi
 
+step "Adding 'vtt' alias to ~/.bashrc"
+BASHRC="$HOME/.bashrc"
+touch "$BASHRC"
+sed -i '/^# >>> voice-to-text >>>$/,/^# <<< voice-to-text <<<$/d' "$BASHRC"  # replace an older block
+cat >> "$BASHRC" <<EOF
+# >>> voice-to-text >>>
+alias vtt="$VENV/bin/python $INSTALL_DIR/app.py"
+# <<< voice-to-text <<<
+EOF
+
 if (( DO_OVERLAY )); then
     step "Installing GNOME overlay extension"
     if command -v gnome-extensions >/dev/null; then
@@ -90,5 +100,6 @@ fi
 step "Done"
 echo "Press $KEY to start recording, press again to transcribe and paste."
 echo "The first transcription downloads the '$MODEL' Whisper model, so it will be slow."
+echo "Settings: vtt settings | vtt set language bn | vtt devices   (open a new terminal or: source ~/.bashrc)"
 (( DO_SERVICE )) && echo "Logs: journalctl --user -u voice-to-text.service -f"
 exit 0

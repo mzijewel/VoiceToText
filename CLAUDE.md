@@ -18,6 +18,10 @@ python3 -m venv .venv && .venv/bin/pip install faster-whisper sounddevice numpy
 .venv/bin/python app.py toggle            # start/stop recording (auto-spawns daemon if not running)
 .venv/bin/python app.py cancel            # discard the current recording
 .venv/bin/python app.py status            # "recording" | "idle"
+.venv/bin/python app.py settings          # show effective settings (+ loaded model, last mic) from the daemon
+.venv/bin/python app.py set language bn   # persist to ~/.config/voice-to-text/config.json and live-reload the daemon
+.venv/bin/python app.py reset language    # drop a saved value (env var / default applies again)
+.venv/bin/python app.py devices           # list input devices for `set device`
 
 ./install.sh [--key K] [--model M] [--language L] [--no-apt|--no-service|--no-overlay]
                                           # full install: apt deps, ~/.local/share copy + venv, service, shortcut, overlay
@@ -32,7 +36,7 @@ System deps: `portaudio19-dev`, `wl-clipboard`, `wtype` (see README.md).
 
 Everything in Python lives in `app.py`; one process runs as the daemon, every other invocation is a thin client.
 
-- **Daemon (`app.py daemon`)** — `VoiceToTextDaemon` listens on a Unix socket at `$XDG_RUNTIME_DIR/voice-to-text.sock`. Plain-text commands: `toggle`, `cancel`, `status`. `toggle` spawns a worker thread (`record_and_transcribe`) that reads 50 ms blocks from `sounddevice` until `stop_event` is set, then saves a WAV under `~/.local/share/voice-to-text/`, transcribes (Whisper model is lazy-loaded on first use and cached), copies, and pastes. Recording only stops on a second `toggle` (no silence auto-stop).
+- **Daemon (`app.py daemon`)** — `VoiceToTextDaemon` listens on a Unix socket at `$XDG_RUNTIME_DIR/voice-to-text.sock`. Plain-text commands: `toggle`, `cancel`, `status`, `settings`, `reload`. `toggle` spawns a worker thread (`record_and_transcribe`) that reads 50 ms blocks from `sounddevice` until `stop_event` is set, then saves a WAV under `~/.local/share/voice-to-text/`, transcribes (Whisper model is lazy-loaded on first use and cached), copies, and pastes. Recording only stops on a second `toggle` (no silence auto-stop).
 - **Client (`app.py toggle|cancel|status`)** — `send_command` connects to the socket. If `toggle` can't connect, `start_daemon` spawns a detached daemon (logging to `~/.local/share/voice-to-text/daemon.log`) guarded by an `flock` on `voice-to-text.lock` so rapid key presses don't start duplicates, then waits for the socket.
 - **Overlay (`gnome-extension/`)** — GNOME Shell extension (UUID `voice-to-text-overlay@local`, ESM, shell 46–50). It does **not** use the socket to learn state; it polls `$XDG_RUNTIME_DIR/voice-to-text.state` every 50 ms. The daemon writes that file atomically (`write_state`) as JSON `{state: idle|recording|processing|error|warning, level, message, ts}` ~20×/s while recording. `processing` carries the current step in `message` ("Loading small model…", "Transcribing… 40%", "Pasting…"), shown as a shimmering label; when the worker ends with a problem it writes `error`/`warning` with a message instead of `idle`, which the overlay shows for 4 s (click to dismiss). The overlay treats a `recording` state older than 1.5 s as stale (daemon died). Its X / ✓ buttons send `cancel` / `toggle` back over the socket.
 
@@ -44,7 +48,9 @@ Two setups coexist; be aware which one a change affects:
 - **Repo-local (current workflow):** `install-shortcut.sh` points the shortcut at `$REPO/.venv/bin/python $REPO/app.py toggle`, and the daemon is auto-started on first toggle.
 - **systemd user service (README.md):** `voice-to-text.service` runs `~/.local/share/voice-to-text/app.py daemon` from a copied install; config is via env vars in the unit file.
 
-## Configuration (env vars)
+## Configuration
+
+Resolved by `load_settings()` per setting as config file (`~/.config/voice-to-text/config.json`, written by `app.py set`) > env var > default; `SETTING_SPECS` lists names, env vars, defaults and allowed values. The daemon re-reads on the `reload` socket command (sent by `set`/`reset`); a changed model/compute_type is loaded on the next transcription.
 
 `VTT_MODEL` (default `small`; `base`/`medium`), `VTT_LANGUAGE` (`auto`, `en`, `bn`), `VTT_COMPUTE_TYPE` (default `int8`), `VTT_LOG_LEVEL` (default `DEBUG`), `VTT_DEVICE` (input device index or name; otherwise `pick_input_device` prefers the pulse/pipewire default source because raw ALSA hw devices reject 16 kHz).
 
