@@ -2,81 +2,63 @@
 
 Local Whisper transcription for Bangla + English, with a desktop global shortcut.
 
-## 1. Install system packages (Ubuntu/Debian)
+## Install
+
+On Ubuntu/Debian with GNOME on Wayland, run from the repo:
 
 ```bash
-sudo apt update
-sudo apt install -y python3-venv python3-dev build-essential portaudio19-dev \
-  wl-clipboard wtype libnotify-bin
+./install.sh
 ```
 
-Check the session:
-```bash
-echo "$XDG_SESSION_TYPE"
-```
-Expected: `wayland`.
+This will:
+1. Install system packages with `sudo apt-get` (`python3-venv`, `python3-dev`, `build-essential`, `portaudio19-dev`, `wl-clipboard`, `wtype`).
+2. Copy `app.py` to `~/.local/share/voice-to-text/` and create a venv there with `faster-whisper`, `sounddevice` and `numpy`.
+3. Install and start the `voice-to-text.service` systemd user service.
+4. Register a GNOME global shortcut (**Ctrl+Alt+Space** by default).
+5. Install the on-screen overlay extension. On Wayland, log out and back in once so GNOME Shell picks it up.
 
-## 2. Install the app
-
-```bash
-mkdir -p ~/.local/share/voice-to-text
-cp app.py ~/.local/share/voice-to-text/app.py
-python3 -m venv ~/.local/share/voice-to-text/venv
-~/.local/share/voice-to-text/venv/bin/pip install --upgrade pip
-~/.local/share/voice-to-text/venv/bin/pip install faster-whisper sounddevice numpy
-chmod +x ~/.local/share/voice-to-text/app.py
-```
-
-The first run downloads the selected Whisper model. `small` is a practical CPU starting point. Change to `base` for lower resource use or `medium` for potentially better recognition at higher CPU/RAM cost. The model runs locally after download.
-
-## 3. Add the user service
+Options:
 
 ```bash
-mkdir -p ~/.config/systemd/user
-cp voice-to-text.service ~/.config/systemd/user/voice-to-text.service
-systemctl --user daemon-reload
-systemctl --user enable --now voice-to-text.service
-systemctl --user status voice-to-text.service
+./install.sh --key '<Super><Shift>space'   # different shortcut
+./install.sh --model base --language bn    # Whisper model / language
+./install.sh --no-apt                      # skip the sudo package install
+./install.sh --no-service                  # no service; the first shortcut press starts the daemon
+./install.sh --no-overlay                  # skip the GNOME overlay
 ```
+
+Re-run `./install.sh --no-apt` after changing `app.py` to copy it over and restart the service.
+
+The first transcription downloads the selected Whisper model. `small` is a practical CPU starting point; `base` uses fewer resources, `medium` may recognize better at higher CPU/RAM cost. The model runs locally after download.
 
 View logs:
 ```bash
 journalctl --user -u voice-to-text.service -f
 ```
 
-## 4. Add the global shortcut
+If you are not on GNOME, bind this command to a shortcut in your desktop's settings:
+```bash
+~/.local/share/voice-to-text/venv/bin/python ~/.local/share/voice-to-text/app.py toggle
+```
+(use the full home path from `echo "$HOME"` if the dialog doesn't expand `~`).
 
-On GNOME:
-1. Open **Settings → Keyboard → View and Customize Shortcuts**.
-2. Find **Custom Shortcuts** (or **View and Customize Shortcuts → Custom Shortcuts**).
-3. Add a shortcut named `Voice to Text`.
-4. Command:
-   ```bash
-   /home/YOUR_USER/.local/share/voice-to-text/venv/bin/python /home/YOUR_USER/.local/share/voice-to-text/app.py toggle
-   ```
-   Replace `YOUR_USER` with your Linux username. You can get the full home path with `echo "$HOME"`.
-5. Set the shortcut to **Super + Shift + Space** if it is available.
-
-If your desktop's shortcut dialog supports `~`, use the full path anyway for reliability.
-
-## 5. Use it
+## Use it
 
 - Focus a text field in your app.
 - Press the shortcut and speak.
-- Press it again to finish, or stop speaking for about 2 seconds after speech.
+- Press it again (or click the check mark on the overlay) to finish; click X to cancel.
 - The recognized text is copied to the Wayland clipboard and pasted with Ctrl+V.
 
-The first transcription may take longer because the model needs to download/load. Check the service logs if nothing happens.
+Recording only stops when you press the shortcut a second time; there is no automatic silence detection. The first transcription may take longer because the model needs to download/load. Check the service logs if nothing happens.
 
 ## Configuration
 
-Edit `~/.config/systemd/user/voice-to-text.service`, then run `systemctl --user daemon-reload` and `systemctl --user restart voice-to-text.service`.
+Re-run `./install.sh --no-apt --model ... --language ...`, or edit `~/.config/systemd/user/voice-to-text.service` and run `systemctl --user daemon-reload && systemctl --user restart voice-to-text.service`.
 
 - `VTT_MODEL=base|small|medium`
 - `VTT_LANGUAGE=auto` lets Whisper detect language; use `bn` for Bangla or `en` for English.
 - `VTT_COMPUTE_TYPE=int8` is intended for CPU inference.
-
-Recording only stops when you run `toggle` a second time; there is no automatic silence detection.
+- `VTT_DEVICE` picks a specific input device (index or name); by default the PulseAudio/PipeWire source is used.
 
 ## Troubleshooting
 
@@ -103,7 +85,7 @@ Some Wayland compositors restrict virtual keyboard input. The text remains in th
 Check system Settings → Sound → Input. Close apps that may be holding an exclusive audio device, then restart the service.
 
 ### Model or CPU resource problems
-Change `VTT_MODEL=base` in the service file for a smaller/faster model, then restart the service.
+Use a smaller/faster model: `./install.sh --no-apt --model base`.
 
 ## Privacy
 
