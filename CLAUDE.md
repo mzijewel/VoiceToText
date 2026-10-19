@@ -32,6 +32,8 @@ python3 -m venv .venv && .venv/bin/pip install faster-whisper sounddevice numpy
 install-windows.ps1 [-Key K] [-Model M] [-Language L] [-NoAutostart] | -Uninstall [-Purge]
 ```
 
+The installers also add a `vtt` alias (`~/.bashrc` / `~/.zshrc` / `vtt.cmd`) for the installed `app.py`, so `vtt set language bn`, `vtt settings` etc. work anywhere.
+
 System deps: `portaudio19-dev`, `wl-clipboard`, `wtype` (see README.md).
 
 ## Architecture
@@ -68,7 +70,7 @@ Resolved by `load_settings()` per setting as config file (`~/.config/voice-to-te
 
 ## Notes
 
-- Logging uses the `logging` module (`log = logging.getLogger("voice-to-text")`), configured by `setup_logging(role)` in `main()`. All processes (daemon and clients) append to a rotating `~/.local/share/voice-to-text/voice-to-text.log`, tagged with role/pid/thread; stderr is added only for a TTY or systemd (`JOURNAL_STREAM`) so an auto-spawned daemon doesn't duplicate lines into `daemon.log`. Use `log.*`, not `print`, for diagnostics.
+- Logging uses the `logging` module (`log = logging.getLogger("voice-to-text")`), configured by `setup_logging(role)` in `main()`. All processes (daemon and clients) append to a rotating `~/.local/share/voice-to-text/voice-to-text.log` as just `<date time> <message>` (no level/role/pid/thread); stderr is added only for a TTY or systemd (`JOURNAL_STREAM`) so an auto-spawned daemon doesn't duplicate lines into `daemon.log`. Use `log.*`, not `print`, for diagnostics.
 - On Linux, desktop notifications (`notify-send`) have been intentionally disabled in favor of the overlay — the `notify(...)` calls in the worker are commented out; only macOS/Windows show popups (for error/warning notices). README.md still mentions `libnotify-bin`; it is no longer required.
 - `install-shortcut.sh` deliberately calls `/usr/bin/gsettings` to avoid a Linuxbrew `gsettings` that may target a different dconf.
 - Audio is passed to Whisper as a numpy array (not the WAV path) to avoid PyAV decoding.

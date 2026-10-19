@@ -158,10 +158,7 @@ def apply_log_level() -> None:
 def setup_logging(role: str) -> None:
     """Log to a rotating file shared by daemon and clients, plus stderr for interactive/systemd runs."""
     level = getattr(logging, SETTINGS["log_level"], logging.DEBUG)
-    fmt = logging.Formatter(
-        f"%(asctime)s.%(msecs)03d %(levelname)-7s [{role} pid=%(process)d %(threadName)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+    fmt = logging.Formatter("%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     handlers: list[logging.Handler] = []
     try:
         APP_DIR.mkdir(parents=True, exist_ok=True)
@@ -821,6 +818,8 @@ class VoiceToTextDaemon:
                     log.log(logging.DEBUG if command == "status" else logging.INFO,
                             "Command %r -> %r", command, result)
                     conn.sendall(result.encode())
+                except (BrokenPipeError, ConnectionResetError):
+                    log.debug("Client hung up before the reply was sent")
                 except Exception as exc:
                     log.exception("Error handling client command")
                     try:

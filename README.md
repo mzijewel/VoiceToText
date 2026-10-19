@@ -122,12 +122,42 @@ System packages installed by `install.sh` (`portaudio19-dev`, `wl-clipboard`, `w
 
 ## Configuration
 
-On every platform, `vtt settings` / `vtt set NAME VALUE` / `vtt reset NAME` is the easiest way. On Linux you can also re-run `./install.sh --no-apt --model ... --language ...`, or edit `~/.config/systemd/user/voice-to-text.service` and run `systemctl --user daemon-reload && systemctl --user restart voice-to-text.service`.
+### The `vtt` command
 
-- `VTT_MODEL=base|small|medium`
-- `VTT_LANGUAGE=auto` lets Whisper detect language; use `bn` for Bangla or `en` for English.
-- `VTT_COMPUTE_TYPE=int8` is intended for CPU inference.
-- `VTT_DEVICE` picks a specific input device (index or name); by default the PulseAudio/PipeWire source is used.
+The installers add a `vtt` alias (to `~/.bashrc` on Linux, `~/.zshrc` on macOS, `vtt.cmd` on Windows) that runs the installed `app.py` with its venv. Open a new terminal (or `source ~/.bashrc`) after installing. In the repo you can use `.venv/bin/python app.py` instead.
+
+```bash
+vtt toggle                 # start/stop recording
+vtt cancel                 # discard the current recording
+vtt status                 # recording | idle
+vtt devices                # list input devices (for `vtt set device`)
+```
+
+### Changing settings
+
+```bash
+vtt settings               # show effective values, where each comes from, loaded model, last mic
+vtt set language bn        # save a value and apply it to the running daemon immediately
+vtt set model medium       # a new model/compute_type is loaded on the next transcription
+vtt reset language         # drop the saved value (env var or default applies again)
+```
+
+Values are saved in `~/.config/voice-to-text/config.json` (`%APPDATA%\voice-to-text` on Windows). Each setting resolves as **saved value > environment variable > default**, so `vtt set` overrides anything in the systemd unit file. No restart is needed.
+
+| Setting | Env var | Default | Values |
+|---|---|---|---|
+| `model` | `VTT_MODEL` | `small` | `tiny`, `base`, `small`, `medium`, `large-v3`, `turbo` |
+| `language` | `VTT_LANGUAGE` | `auto` | `auto` (detect), `en`, `bn` |
+| `compute_type` | `VTT_COMPUTE_TYPE` | `int8` | `int8`, `int8_float32`, `int16`, `float32` |
+| `device` | `VTT_DEVICE` | `auto` | input device index or name (see `vtt devices`) |
+| `hotkey` | `VTT_HOTKEY` | `off` on Linux, `<ctrl>+<alt>+<space>` elsewhere | pynput syntax, or `off` |
+| `sounds` | `VTT_SOUNDS` | `off` on Linux, `on` elsewhere | `on`, `off` |
+| `cleanup` | `VTT_CLEANUP` | `off` | `off`, `ollama`, `claude` (LLM tidy-up of the transcript) |
+| `ollama_model` / `ollama_url` | `VTT_OLLAMA_MODEL` / `VTT_OLLAMA_URL` | `gemma4:e4b` / `http://localhost:11434` | any |
+| `claude_model` | `VTT_CLAUDE_MODEL` | `haiku` | `haiku`, `sonnet`, `opus` or a full model id |
+| `log_level` | `VTT_LOG_LEVEL` | `DEBUG` | `DEBUG`, `INFO`, `WARNING`, `ERROR` |
+
+On Linux you can alternatively re-run `./install.sh --no-apt --model ... --language ...`, or edit the `Environment=` lines in `~/.config/systemd/user/voice-to-text.service` and run `systemctl --user daemon-reload && systemctl --user restart voice-to-text.service`.
 
 ## Troubleshooting
 
