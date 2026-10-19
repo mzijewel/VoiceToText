@@ -1,8 +1,12 @@
-# Linux Voice-to-Text (Wayland)
+# Voice-to-Text (Linux, macOS, Windows)
 
 Local Whisper transcription for Bangla + English, with a desktop global shortcut.
 
-## Install
+Linux (GNOME on Wayland) is the main target and has the on-screen overlay. macOS and Windows are supported too
+(see [macOS](#macos) and [Windows](#windows)): there the daemon listens for the hotkey itself, beeps on
+start/stop, and shows problems as a system notification instead of the overlay.
+
+## Install (Linux)
 
 On Ubuntu/Debian with GNOME on Wayland, run from the repo:
 
@@ -45,12 +49,52 @@ If you are not on GNOME, bind this command to a shortcut in your desktop's setti
 ```
 (use the full home path from `echo "$HOME"` if the dialog doesn't expand `~`).
 
+## macOS
+
+Needs Python 3.9+ (python.org or Homebrew). From the repo:
+
+```bash
+./install-macos.sh                                  # or: --key '<cmd>+<shift>+<space>' --model base --language bn
+```
+
+This copies `app.py` and a venv (`faster-whisper`, `sounddevice`, `numpy`, `pynput`) to
+`~/Library/Application Support/voice-to-text/`, installs a LaunchAgent (`local.voice-to-text`) that runs the
+daemon at login, and adds a `vtt` alias to `~/.zshrc`. Then, in **System Settings → Privacy & Security**, allow
+the Python binary the installer prints under **Microphone**, **Accessibility** (to paste with Cmd+V) and
+**Input Monitoring** (for the hotkey), and restart the daemon:
+`launchctl kickstart -k gui/$(id -u)/local.voice-to-text`.
+
+Uninstall: `./install-macos.sh --uninstall` (add `--purge` to also delete recordings, settings and models).
+
+## Windows
+
+Install Python 3 from python.org, then from the repo in PowerShell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install-windows.ps1     # or: -Key '<ctrl>+<shift>+<space>' -Model base -Language bn
+```
+
+This copies `app.py` and a venv to `%LOCALAPPDATA%\voice-to-text\`, adds a Startup-folder shortcut that runs
+the daemon (windowless, via `pythonw`) at login, starts it, and creates `vtt.cmd` there for the commands below.
+Settings live in `%APPDATA%\voice-to-text\config.json`. The hotkey uses Windows' `RegisterHotKey`, so no extra
+package or permission is needed; it fails (see the log) if another app already owns that combination. Pasting
+does not work into apps running as Administrator unless the daemon does too.
+
+Uninstall: `install-windows.ps1 -Uninstall` (add `-Purge` to also delete recordings, settings and models).
+
+### Hotkey and settings on macOS/Windows
+
+The default hotkey is **Ctrl+Alt+Space**. Change it with `vtt set hotkey '<cmd>+<shift>+<space>'` (pynput
+syntax: `<ctrl>`, `<alt>`, `<shift>`, `<cmd>`, plus a letter, digit, `<space>`, `<f1>`…); `vtt set hotkey off`
+disables it. `vtt set sounds off` silences the beeps. All other `vtt` commands work as on Linux. You can also
+run the daemon in the foreground with `python app.py daemon` to watch its log.
+
 ## Use it
 
 - Focus a text field in your app.
 - Press the shortcut and speak.
 - Press it again (or click the check mark on the overlay) to finish; click X to cancel.
-- The recognized text is copied to the Wayland clipboard and pasted with Ctrl+V.
+- The recognized text is copied to the clipboard and pasted with Ctrl+V (Cmd+V on macOS).
 
 Recording only stops when you press the shortcut a second time; there is no automatic silence detection. The first transcription may take longer because the model needs to download/load. Check the service logs if nothing happens.
 
@@ -78,7 +122,7 @@ System packages installed by `install.sh` (`portaudio19-dev`, `wl-clipboard`, `w
 
 ## Configuration
 
-Re-run `./install.sh --no-apt --model ... --language ...`, or edit `~/.config/systemd/user/voice-to-text.service` and run `systemctl --user daemon-reload && systemctl --user restart voice-to-text.service`.
+On every platform, `vtt settings` / `vtt set NAME VALUE` / `vtt reset NAME` is the easiest way. On Linux you can also re-run `./install.sh --no-apt --model ... --language ...`, or edit `~/.config/systemd/user/voice-to-text.service` and run `systemctl --user daemon-reload && systemctl --user restart voice-to-text.service`.
 
 - `VTT_MODEL=base|small|medium`
 - `VTT_LANGUAGE=auto` lets Whisper detect language; use `bn` for Bangla or `en` for English.

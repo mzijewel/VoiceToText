@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Wayland-friendly local voice-to-text daemon for Linux."""
+"""Local voice-to-text daemon for Linux (GNOME/Wayland), macOS and Windows."""
 from __future__ import annotations
 
 import argparse
-import fcntl
 import json
 import logging
 import logging.handlers
@@ -19,13 +18,40 @@ import time
 import urllib.request
 from pathlib import Path
 
+IS_LINUX = sys.platform.startswith("linux")
+IS_MAC = sys.platform == "darwin"
+IS_WINDOWS = sys.platform == "win32"
+if IS_WINDOWS:
+    import msvcrt
+else:
+    import fcntl
+
 import numpy as np
 import sounddevice as sd
 from faster_whisper import WhisperModel
 
-APP_DIR = Path.home() / ".local" / "share" / "voice-to-text"
-RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", f"/tmp/voice-to-text-{os.getuid()}"))
+
+
+def platform_dirs() -> tuple[Path, Path, Path]:
+    """(data dir, config dir, runtime dir) in each OS's usual places."""
+    home = Path.home()
+    if IS_WINDOWS:
+        local = Path(os.environ.get("LOCALAPPDATA", home / "AppData" / "Local")) / "voice-to-text"
+        roaming = Path(os.environ.get("APPDATA", home / "AppData" / "Roaming")) / "voice-to-text"
+        return local, roaming, local
+    if IS_MAC:
+        support = home / "Library" / "Application Support" / "voice-to-text"
+        return support, support, support  # not $TMPDIR: launchd agents may see a different one
+    return (
+        home / ".local" / "share" / "voice-to-text",
+        Path(os.environ.get("XDG_CONFIG_HOME", home / ".config")) / "voice-to-text",
+        Path(os.environ.get("XDG_RUNTIME_DIR", f"/tmp/voice-to-text-{os.getuid()}")),
+    )
+
+
+APP_DIR, CONFIG_DIR, RUNTIME_DIR = platform_dirs()
 SOCKET_PATH = RUNTIME_DIR / "voice-to-text.sock"
+PORT_PATH = RUNTIME_DIR / "voice-to-text.port"  # Windows (no AF_UNIX): daemon's TCP port on 127.0.0.1
 STATE_PATH = RUNTIME_DIR / "voice-to-text.state"  # read by the GNOME Shell overlay
 LOG_PATH = APP_DIR / "voice-to-text.log"
 SAMPLE_RATE = 16000
@@ -33,7 +59,10 @@ CHANNELS = 1
 BLOCK_SECONDS = 0.05
 LEVEL_LOG_SECONDS = 1.0  # how often to log a mic level summary while recording
 PASTE_ACK_TIMEOUT = 1.0  # seconds to wait for the overlay to confirm it pressed Ctrl+V (it polls every 50 ms)
-CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "voice-to-text" / "config.json"
+CONFIG_PATH = CONFIG_DIR / "config.json"
+# GNOME binds the shortcut itself; elsewhere the daemon listens for it (pynput key syntax).
+DEFAULT_HOTKEY = "off" if IS_LINUX else "<ctrl>+<alt>+<space>"
+NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if IS_WINDOWS else {}  # no console flash
 # name -> (env var, default, allowed values or None for free-form)
 SETTING_SPECS: dict[str, tuple[str, str, tuple[str, ...] | None]] = {
     "model": ("VTT_MODEL", "small", ("tiny", "base", "small", "medium", "large-v3", "turbo")),
@@ -45,6 +74,9 @@ SETTING_SPECS: dict[str, tuple[str, str, tuple[str, ...] | None]] = {
     "ollama_model": ("VTT_OLLAMA_MODEL", "gemma4:e4b", None),
     "ollama_url": ("VTT_OLLAMA_URL", "http://localhost:11434", None),
     "claude_model": ("VTT_CLAUDE_MODEL", "haiku", None),  # alias (haiku/sonnet/opus) or full model id
+    "hotkey": ("VTT_HOTKEY", DEFAULT_HOTKEY, None),  # e.g. <ctrl>+<alt>+<space>, or off
+    # Start/stop/problem beeps; on by default where there is no overlay to show the state.
+    "sounds": ("VTT_SOUNDS", "off" if IS_LINUX else "on", ("on", "off")),
 }
 CLEANUP_TIMEOUT = 60  # seconds; covers a cold Ollama model load on CPU
 CLAUDE_TIMEOUT = 20  # a normal call takes ~3s; offline the CLI retries for minutes, so give up and fall back
@@ -139,7 +171,7 @@ def setup_logging(role: str) -> None:
     except OSError as exc:
         print(f"Could not open log file {LOG_PATH}: {exc}", file=sys.stderr)
     # An auto-spawned daemon's stderr is daemon.log; skip it there to avoid duplicating every line.
-    if sys.stderr.isatty() or os.environ.get("JOURNAL_STREAM") or not handlers:
+    if sys.stderr and (sys.stderr.isatty() or os.environ.get("JOURNAL_STREAM") or not handlers):
         handlers.append(logging.StreamHandler(sys.stderr))
     root = logging.getLogger()
     root.setLevel(logging.WARNING)  # keep third-party chatter (urllib3, filelock, …) quiet
@@ -173,6 +205,9 @@ def pick_input_device() -> int | str | None:
             "Audio device %d: %r in=%d out=%d default_sr=%.0f",
             index, dev["name"], dev["max_input_channels"], dev["max_output_channels"], dev["default_samplerate"],
         )
+    if not IS_LINUX:
+        log.info("Using the system default input device")
+        return None
     for index, dev in enumerate(devices):
         if dev["max_input_channels"] > 0 and dev["name"] in ("pulse", "Default Source", "pipewire", "default"):
             log.info("Selected input device %d: %r", index, dev["name"])
@@ -181,18 +216,227 @@ def pick_input_device() -> int | str | None:
     return None
 
 
+WINDOWS_BALLOON = (  # PowerShell; the message comes in $env:VTT_MESSAGE to avoid quoting issues
+    "Add-Type -AssemblyName System.Windows.Forms; $n = New-Object System.Windows.Forms.NotifyIcon; "
+    "$n.Icon = [System.Drawing.SystemIcons]::Information; $n.Visible = $true; "
+    "$n.ShowBalloonTip(4000, 'Voice to Text', $env:VTT_MESSAGE, 'None'); Start-Sleep 5; $n.Dispose()"
+)
+
+
 def notify(message: str, *, popup: bool = False) -> None:
     """Log a status message; only show a desktop popup for problems the overlay can't show."""
     log.info("%s", message)
     if not popup:
         return
+    env = None
+    if IS_MAC:
+        args = ["osascript", "-e", "on run argv", "-e",
+                'display notification (item 1 of argv) with title "Voice to Text"', "-e", "end run", message]
+    elif IS_WINDOWS:
+        args = ["powershell", "-NoProfile", "-NonInteractive", "-Command", WINDOWS_BALLOON]
+        env = {**os.environ, "VTT_MESSAGE": message}
+    else:
+        args = ["notify-send", "--app-name=Voice to Text", "Voice to Text", message]
     try:
-        subprocess.Popen(
-            ["notify-send", "--app-name=Voice to Text", "Voice to Text", message],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
+        subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, **NO_WINDOW)
     except FileNotFoundError:
-        log.warning("notify-send not found; popup not shown")
+        log.warning("%s not found; popup not shown", args[0])
+
+
+CUES = {"start": (880, 0.08), "stop": (660, 0.08), "problem": (220, 0.25)}  # (Hz, seconds)
+
+
+def play_cue(kind: str) -> None:
+    """Short beep so recording start/stop is noticeable without the GNOME overlay."""
+    if SETTINGS["sounds"] != "on":
+        return
+    freq, seconds = CUES[kind]
+    rate = 44100
+    t = np.arange(int(rate * seconds)) / rate
+    envelope = np.clip(np.minimum(t, seconds - t) * 200, 0, 1)  # 5 ms fades avoid clicks
+    try:
+        sd.play((0.2 * envelope * np.sin(2 * np.pi * freq * t)).astype(np.float32), rate)
+    except Exception as exc:
+        log.debug("Could not play %s cue: %s", kind, exc)
+
+
+def copy_to_clipboard(text: str) -> None:
+    if IS_MAC:
+        # pbcopy decodes stdin using the locale, which is unset for launchd agents
+        result = subprocess.run(["pbcopy"], input=text.encode("utf-8"), env={**os.environ, "LC_CTYPE": "UTF-8"},
+                                capture_output=True, timeout=5, check=False)
+        if result.returncode != 0:
+            raise RuntimeError(f"pbcopy failed with exit code {result.returncode}: {result.stderr.decode().strip()}")
+        log.info("Copied to clipboard (pbcopy)")
+    elif IS_WINDOWS:
+        windows_set_clipboard(text)
+        log.info("Copied to clipboard (Win32)")
+    else:
+        # wl-copy stays alive to serve the clipboard, so don't capture its pipes.
+        copier = subprocess.Popen(
+            ["wl-copy", "--type", "text/plain;charset=utf-8"],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        copier.stdin.write(text.encode("utf-8"))
+        copier.stdin.close()
+        time.sleep(0.1)
+        if copier.poll() not in (None, 0):
+            raise RuntimeError(f"wl-copy failed with exit code {copier.returncode}")
+        log.info("Copied to clipboard (wl-copy pid=%d)", copier.pid)
+
+
+def windows_set_clipboard(text: str) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    user32.OpenClipboard.argtypes = [wintypes.HWND]
+    user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+    user32.SetClipboardData.restype = wintypes.HANDLE
+    kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+    kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+    kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalLock.restype = wintypes.LPVOID
+    kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalFree.argtypes = [wintypes.HGLOBAL]
+    data = text.encode("utf-16-le") + b"\0\0"
+    for _ in range(20):  # another app may be holding the clipboard for a moment
+        if user32.OpenClipboard(None):
+            break
+        time.sleep(0.05)
+    else:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        user32.EmptyClipboard()
+        handle = kernel32.GlobalAlloc(0x0002, len(data))  # GMEM_MOVEABLE
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        ctypes.memmove(kernel32.GlobalLock(handle), data, len(data))
+        kernel32.GlobalUnlock(handle)
+        if not user32.SetClipboardData(13, handle):  # CF_UNICODETEXT; on success the clipboard owns handle
+            kernel32.GlobalFree(handle)
+            raise ctypes.WinError(ctypes.get_last_error())
+    finally:
+        user32.CloseClipboard()
+
+
+def press_paste_keys() -> bool:
+    """macOS/Windows: press Cmd+V / Ctrl+V in the focused app."""
+    if IS_MAC:
+        # Needs Accessibility permission for the daemon's python (System Settings > Privacy & Security).
+        result = run_cmd(["osascript", "-e", 'tell application "System Events" to keystroke "v" using command down'])
+        if result.returncode != 0:
+            log.error("Auto-paste failed (osascript exit %d): %s; grant Accessibility permission to %s",
+                      result.returncode, result.stderr.strip(), sys.executable)
+            return False
+        return True
+    import ctypes
+
+    user32 = ctypes.WinDLL("user32")
+    vk_control, vk_v, keyup = 0x11, 0x56, 0x0002
+    for vk, flags in ((vk_control, 0), (vk_v, 0), (vk_v, keyup), (vk_control, keyup)):
+        user32.keybd_event(vk, 0, flags, 0)
+    return True
+
+
+WINDOWS_MODIFIERS = {"ctrl": 0x2, "alt": 0x1, "shift": 0x4, "cmd": 0x8, "win": 0x8}
+WINDOWS_KEYS = {"space": 0x20, "enter": 0x0D, "tab": 0x09, "esc": 0x1B, "backspace": 0x08, "insert": 0x2D,
+                "delete": 0x2E, "home": 0x24, "end": 0x23, "page_up": 0x21, "page_down": 0x22,
+                "pause": 0x13, "scroll_lock": 0x91}
+
+
+def parse_windows_hotkey(combo: str) -> tuple[int, int]:
+    """pynput-style "<ctrl>+<alt>+<space>" -> (RegisterHotKey modifiers, virtual key code)."""
+    mods, vk = 0x4000, None  # MOD_NOREPEAT: holding the keys doesn't toggle repeatedly
+    for part in combo.lower().split("+"):
+        name = part.strip().strip("<>").removesuffix("_l").removesuffix("_r")
+        if name in WINDOWS_MODIFIERS:
+            mods |= WINDOWS_MODIFIERS[name]
+        elif len(name) == 1 and name.isascii() and name.isalnum():
+            vk = ord(name.upper())
+        elif name in WINDOWS_KEYS:
+            vk = WINDOWS_KEYS[name]
+        elif name[:1] == "f" and name[1:].isdigit() and 1 <= int(name[1:]) <= 24:
+            vk = 0x6F + int(name[1:])
+        else:
+            raise ValueError(f"unknown key {part.strip()!r}")
+    if vk is None:
+        raise ValueError("the hotkey needs a non-modifier key, e.g. <ctrl>+<alt>+<space>")
+    return mods, vk
+
+
+def validate_hotkey(combo: str) -> None:
+    if combo == "off":
+        return
+    if IS_WINDOWS:
+        parse_windows_hotkey(combo)
+        return
+    from pynput import keyboard
+    keyboard.HotKey.parse(combo)
+
+
+class GlobalHotkey:
+    """Calls `callback` whenever `combo` is pressed in any app.
+
+    Windows uses RegisterHotKey (no extra package, and the key press doesn't reach the focused app). Elsewhere
+    pynput is used; on macOS it needs the Accessibility / Input Monitoring permission. GNOME on Wayland can't
+    use either, so there the hotkey is off and GNOME's own custom shortcut runs `app.py toggle`.
+    """
+
+    def __init__(self, combo: str, callback) -> None:
+        self.combo = combo
+        self.callback = callback
+        self.listener = None
+        self.thread_id = 0
+        if IS_WINDOWS:
+            mods, vk = parse_windows_hotkey(combo)
+            ready = threading.Event()
+            threading.Thread(target=self._windows_loop, args=(mods, vk, ready), name="hotkey", daemon=True).start()
+            ready.wait(2)
+        else:
+            from pynput import keyboard
+            self.listener = keyboard.GlobalHotKeys({combo: self._pressed})
+            self.listener.start()
+            log.info("Listening for hotkey %s", combo)
+            if IS_MAC:
+                log.info("If the hotkey does nothing, allow %s under Privacy & Security > Accessibility and "
+                         "Input Monitoring", sys.executable)
+
+    def _pressed(self) -> None:
+        log.info("Hotkey %s pressed", self.combo)
+        try:
+            self.callback()
+        except Exception:
+            log.exception("Hotkey action failed")
+
+    def _windows_loop(self, mods: int, vk: int, ready: threading.Event) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        self.thread_id = ctypes.WinDLL("kernel32").GetCurrentThreadId()
+        if not user32.RegisterHotKey(None, 1, mods, vk):
+            log.error("Could not register hotkey %s (used by another app?): %s",
+                      self.combo, ctypes.WinError(ctypes.get_last_error()))
+            ready.set()
+            return
+        log.info("Listening for hotkey %s", self.combo)
+        ready.set()
+        msg = wintypes.MSG()
+        try:
+            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                if msg.message == 0x0312:  # WM_HOTKEY
+                    self._pressed()
+        finally:
+            user32.UnregisterHotKey(None, 1)
+
+    def stop(self) -> None:
+        if self.listener:
+            self.listener.stop()
+        elif self.thread_id:
+            import ctypes
+            ctypes.WinDLL("user32").PostThreadMessageW(self.thread_id, 0x0012, 0, 0)  # WM_QUIT
 
 
 def run_cmd(args: list[str], *, input_text: str | None = None, timeout: float = 5) -> subprocess.CompletedProcess:
@@ -200,7 +444,7 @@ def run_cmd(args: list[str], *, input_text: str | None = None, timeout: float = 
     start = time.perf_counter()
     result = subprocess.run(
         args, input=input_text, text=True, stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE, timeout=timeout, check=False,
+        stderr=subprocess.PIPE, timeout=timeout, check=False, **NO_WINDOW,
     )
     log.debug(
         "%s exited %d in %.3fs; stdout=%r stderr=%r",
@@ -224,7 +468,25 @@ class VoiceToTextDaemon:
         self.last_state: tuple[str, str] | None = None
         self.paste_id = 0
         self.paste_acked = threading.Event()
+        self.hotkey: GlobalHotkey | None = None
         self.write_state("idle")
+
+    def setup_hotkey(self) -> None:
+        """(Re)start the global hotkey listener to match the `hotkey` setting."""
+        combo = SETTINGS["hotkey"]
+        if self.hotkey and self.hotkey.combo == combo:
+            return
+        if self.hotkey:
+            self.hotkey.stop()
+            self.hotkey = None
+        if combo == "off":
+            return
+        try:
+            self.hotkey = GlobalHotkey(combo, self.toggle)
+        except ImportError:
+            log.error("Hotkey %s needs pynput: pip install pynput", combo)
+        except Exception:
+            log.exception("Could not set up hotkey %s", combo)
 
     def write_state(self, state: str, level: float = 0.0, message: str = "", **extra) -> None:
         """Publish state for the on-screen overlay (atomic replace so readers never see partial JSON).
@@ -275,6 +537,8 @@ class VoiceToTextDaemon:
         apply_log_level()
         changed = {k: (old[k], v) for k, v in SETTINGS.items() if old[k] != v}
         log.info("Settings reloaded; changed: %s", changed or "nothing")
+        if "hotkey" in changed:
+            self.setup_hotkey()
         return "Settings reloaded (model changes load on the next transcription)." if changed else "No changes."
 
     def toggle(self) -> str:
@@ -318,6 +582,7 @@ class VoiceToTextDaemon:
             ) as stream:
                 log.info("Recording started (stream opened in %.3fs, latency %.3fs)",
                          time.perf_counter() - open_start, stream.latency)
+                play_cue("start")
                 while not self.stop_event.is_set():
                     data, overflowed = stream.read(blocksize)
                     if overflowed:
@@ -338,6 +603,7 @@ class VoiceToTextDaemon:
 
             log.info("Recording stopped: %d blocks (%.2fs), %d overflow(s)",
                      len(chunks), len(chunks) * BLOCK_SECONDS, overflows)
+            play_cue("stop")
 
             if self.cancelled:
                 # notify("Recording cancelled.")
@@ -425,26 +691,15 @@ class VoiceToTextDaemon:
                     notice = ("warning", "Cleanup failed — pasted raw text")
                 cleanup_seconds = time.perf_counter() - cleanup_start
 
-            # Put recognized text on the Wayland clipboard.
-            # wl-copy stays alive to serve the clipboard, so don't capture its pipes.
             self.write_state("processing", message="Pasting…")
-            log.debug("Copying %d chars to clipboard with wl-copy", len(text))
-            copier = subprocess.Popen(
-                ["wl-copy", "--type", "text/plain;charset=utf-8"],
-                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-            copier.stdin.write(text.encode("utf-8"))
-            copier.stdin.close()
-            time.sleep(0.1)
-            if copier.poll() not in (None, 0):
-                raise RuntimeError(f"wl-copy failed with exit code {copier.returncode}")
-            log.info("Copied to clipboard (wl-copy pid=%d)", copier.pid)
+            log.debug("Copying %d chars to clipboard", len(text))
+            copy_to_clipboard(text)
 
             # Give the clipboard manager a moment, then paste into the focused app.
             time.sleep(0.25)
             if not self.paste():
                 # notify("Text copied, but auto-paste failed. Paste with Ctrl+V.", popup=True)
-                notice = ("warning", "Copied — auto-paste failed, press Ctrl+V")
+                notice = ("warning", f"Copied — auto-paste failed, press {'Cmd' if IS_MAC else 'Ctrl'}+V")
             total_seconds = time.perf_counter() - processing_start
             log.info("Transcription (%s): %s", info.language, text)
             log.info("Timing: audio %.1fs | model load %.2fs | transcribe %.2fs | cleanup %.2fs | "
@@ -463,6 +718,9 @@ class VoiceToTextDaemon:
                 self.stop_event.clear()
             if notice:
                 self.write_state(notice[0], message=notice[1])
+                if not IS_LINUX:  # no overlay to show it
+                    play_cue("problem")
+                    notify(notice[1], popup=True)
             else:
                 self.write_state("idle")
 
@@ -471,7 +729,13 @@ class VoiceToTextDaemon:
 
         GNOME's compositor has no virtual-keyboard protocol for wtype, so ask the overlay extension (running
         inside gnome-shell) to inject the keys; fall back to wtype for other compositors or without the overlay.
+        macOS and Windows press the keys directly.
         """
+        if not IS_LINUX:
+            if not press_paste_keys():
+                return False
+            log.info("Pasted into focused app")
+            return True
         self.paste_id += 1
         self.paste_acked.clear()
         self.write_state("pasting", message="Pasting…", id=self.paste_id)
@@ -496,18 +760,41 @@ class VoiceToTextDaemon:
     def serve(self) -> None:
         log.info("Daemon starting: python %s on %s, pid %d", platform.python_version(), platform.platform(), os.getpid())
         log.info("Config: %s", ", ".join(f"{k}={v} ({SETTING_SOURCES[k]})" for k, v in SETTINGS.items()))
-        log.info("Paths: socket=%s state=%s app_dir=%s log=%s", SOCKET_PATH, STATE_PATH, APP_DIR, LOG_PATH)
-        SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
+        log.info("Paths: socket=%s state=%s app_dir=%s log=%s",
+                 PORT_PATH if IS_WINDOWS else SOCKET_PATH, STATE_PATH, APP_DIR, LOG_PATH)
+        RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+        if IS_WINDOWS:
+            self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server.bind(("127.0.0.1", 0))
+            self.server.listen(8)
+            port = self.server.getsockname()[1]
+            tmp = PORT_PATH.with_suffix(".tmp")
+            tmp.write_text(str(port))
+            os.replace(tmp, PORT_PATH)  # written after listen(), so a client that finds it can connect
+            log.info("Voice-to-Text daemon listening on 127.0.0.1:%d", port)
+        else:
+            try:
+                SOCKET_PATH.unlink()
+                log.debug("Removed stale socket %s", SOCKET_PATH)
+            except FileNotFoundError:
+                pass
+            self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.server.bind(str(SOCKET_PATH))
+            os.chmod(SOCKET_PATH, 0o600)
+            self.server.listen(8)
+            log.info("Voice-to-Text daemon listening on %s", SOCKET_PATH)
+        self.setup_hotkey()
         try:
-            SOCKET_PATH.unlink()
-            log.debug("Removed stale socket %s", SOCKET_PATH)
-        except FileNotFoundError:
-            pass
-        self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.server.bind(str(SOCKET_PATH))
-        os.chmod(SOCKET_PATH, 0o600)
-        self.server.listen(8)
-        log.info("Voice-to-Text daemon listening on %s", SOCKET_PATH)
+            self.accept_loop()
+        finally:
+            if IS_WINDOWS:
+                try:
+                    if PORT_PATH.read_text() == str(port):  # unless a newer daemon took over
+                        PORT_PATH.unlink()
+                except OSError:
+                    pass
+
+    def accept_loop(self) -> None:
         while True:
             conn, _ = self.server.accept()
             with conn:
@@ -542,11 +829,26 @@ class VoiceToTextDaemon:
                         pass  # client (e.g. the overlay) already hung up
 
 
-def send_command(command: str) -> str:
+def connect_daemon(timeout: float = 2) -> socket.socket:
+    if IS_WINDOWS:
+        try:
+            port = int(PORT_PATH.read_text())
+        except ValueError:
+            raise ConnectionRefusedError(f"bad port file {PORT_PATH}") from None
+        return socket.create_connection(("127.0.0.1", port), timeout=timeout)
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    client.settimeout(2)
+    client.settimeout(timeout)
     try:
         client.connect(str(SOCKET_PATH))
+    except OSError:
+        client.close()
+        raise
+    return client
+
+
+def send_command(command: str) -> str:
+    client = connect_daemon()
+    try:
         client.sendall(command.encode())
         chunks = []
         while chunk := client.recv(4096):
@@ -562,7 +864,7 @@ def start_daemon(timeout: float = 30) -> None:
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     with open(lock_path, "w") as lock:
         log.debug("Waiting for startup lock %s", lock_path)
-        fcntl.flock(lock, fcntl.LOCK_EX)  # a second key press waits here instead of spawning another daemon
+        lock_exclusive(lock)  # a second key press waits here instead of spawning another daemon
         try:
             send_command("status")
             log.info("Daemon was started by another client while waiting for the lock")
@@ -571,12 +873,17 @@ def start_daemon(timeout: float = 30) -> None:
             pass
         APP_DIR.mkdir(parents=True, exist_ok=True)
         start = time.monotonic()
+        python, detach = sys.executable, {"start_new_session": True}
+        if IS_WINDOWS:
+            pythonw = Path(sys.executable).with_name("pythonw.exe")  # no console window
+            python = str(pythonw) if pythonw.exists() else python
+            detach = {"creationflags": subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP}
         with open(APP_DIR / "daemon.log", "ab") as log_file:
             proc = subprocess.Popen(
-                [sys.executable, str(Path(__file__).resolve()), "daemon"],
-                stdin=subprocess.DEVNULL, stdout=log_file, stderr=log_file, start_new_session=True,
+                [python, str(Path(__file__).resolve()), "daemon"],
+                stdin=subprocess.DEVNULL, stdout=log_file, stderr=log_file, **detach,
             )
-        log.info("Spawned daemon pid %d (%s)", proc.pid, sys.executable)
+        log.info("Spawned daemon pid %d (%s)", proc.pid, python)
         deadline = start + timeout
         while time.monotonic() < deadline:
             try:
@@ -590,6 +897,19 @@ def start_daemon(timeout: float = 30) -> None:
                 time.sleep(0.1)
         log.error("Daemon did not start within %.0fs", timeout)
         raise TimeoutError(f"daemon did not start within {timeout:.0f}s (see {APP_DIR / 'daemon.log'})")
+
+
+def lock_exclusive(file) -> None:
+    """Block until we hold an exclusive lock on `file` (released when it is closed)."""
+    if not IS_WINDOWS:
+        fcntl.flock(file, fcntl.LOCK_EX)
+        return
+    while True:
+        try:
+            msvcrt.locking(file.fileno(), msvcrt.LK_LOCK, 1)  # gives up after ~10 s, so keep trying
+            return
+        except OSError:
+            log.debug("Still waiting for startup lock")
 
 
 def ollama_chat(messages: list[dict[str, str]], timeout: float) -> str:
@@ -633,7 +953,7 @@ def preload_ollama_model() -> None:
 
 def find_claude() -> str:
     # The auto-spawned daemon may not inherit a PATH containing ~/.local/bin.
-    path = shutil.which("claude") or str(Path.home() / ".local" / "bin" / "claude")
+    path = shutil.which("claude") or str(Path.home() / ".local" / "bin" / ("claude.exe" if IS_WINDOWS else "claude"))
     if not os.access(path, os.X_OK):
         raise FileNotFoundError("claude CLI not found (install Claude Code or put it on PATH)")
     return path
@@ -647,7 +967,7 @@ def claude_complete(transcript: str, timeout: float) -> str:
          "--tools", "", "--strict-mcp-config", "--setting-sources", "", "--no-session-persistence",
          "--disable-slash-commands"],
         input=transcript, text=True, capture_output=True, timeout=timeout, check=False,
-        cwd=APP_DIR, env=env,  # a neutral cwd so no project CLAUDE.md is loaded
+        cwd=APP_DIR, env=env, **NO_WINDOW,  # a neutral cwd so no project CLAUDE.md is loaded
     )
     if result.returncode != 0:
         raise RuntimeError(f"claude exited {result.returncode}: {(result.stderr or result.stdout).strip()[:200]}")
@@ -710,6 +1030,14 @@ def change_setting(name: str, value: str | None) -> int:
         if choices and value not in choices:
             print(f"Invalid {name} {value!r}; choose from: {', '.join(choices)}", file=sys.stderr)
             return 2
+        if name == "hotkey":
+            try:
+                validate_hotkey(value)
+            except ImportError:
+                print("Warning: pynput is not installed (pip install pynput); saving anyway.", file=sys.stderr)
+            except ValueError as exc:
+                print(f"Invalid hotkey {value!r}: {exc}. Example: <ctrl>+<alt>+<space>", file=sys.stderr)
+                return 2
         if name == "ollama_model":
             try:
                 with urllib.request.urlopen(SETTINGS["ollama_url"].rstrip("/") + "/api/tags", timeout=3) as response:
@@ -733,12 +1061,20 @@ def change_setting(name: str, value: str | None) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Local Wayland voice-to-text",
+        description="Local voice-to-text (Linux/Wayland, macOS, Windows)",
         epilog="examples: app.py settings | app.py set language bn | app.py reset language | app.py devices",
     )
     parser.add_argument("command", choices=["daemon", "toggle", "cancel", "status", "settings", "set", "reset", "devices"])
     parser.add_argument("args", nargs="*", help="set: NAME VALUE; reset: NAME")
     args = parser.parse_args()
+    if args.command == "daemon" and sys.stderr is None:
+        # pythonw (Windows autostart) has no stderr, but libraries (download progress bars) still write to it.
+        APP_DIR.mkdir(parents=True, exist_ok=True)
+        sys.stdout = sys.stderr = open(APP_DIR / "daemon.log", "a", encoding="utf-8", buffering=1)
+    if IS_WINDOWS:
+        for stream in (sys.stdout, sys.stderr):  # a non-UTF-8 console must not crash on Bangla text
+            if stream and hasattr(stream, "reconfigure"):
+                stream.reconfigure(errors="replace")
     setup_logging(args.command)
     if args.command == "set":
         if len(args.args) != 2:
@@ -778,7 +1114,10 @@ def main() -> int:
         return 0
     except OSError as exc:
         log.error("Voice-to-Text daemon is not running: %s", exc)
-        print("Start it with: systemctl --user start voice-to-text.service", file=sys.stderr)
+        if IS_LINUX:
+            print("Start it with: systemctl --user start voice-to-text.service", file=sys.stderr)
+        else:
+            print(f"Start it with: {Path(sys.executable).name} {Path(__file__).name} daemon", file=sys.stderr)
         return 1
 
 
