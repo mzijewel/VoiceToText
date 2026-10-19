@@ -21,6 +21,7 @@ python3 -m venv .venv && .venv/bin/pip install faster-whisper sounddevice numpy
 
 ./install.sh [--key K] [--model M] [--language L] [--no-apt|--no-service|--no-overlay]
                                           # full install: apt deps, ~/.local/share copy + venv, service, shortcut, overlay
+./uninstall.sh [--purge]                  # reverse install.sh; --purge also removes recordings + HF model cache
 ./install-shortcut.sh ['<Ctrl><Alt>space']  # register GNOME custom keybinding -> app.py toggle (VTT_PYTHON/VTT_APP override paths)
 ./install-overlay.sh                      # install/enable the GNOME Shell extension (needs re-login on Wayland)
 ```

@@ -51,6 +51,28 @@ If you are not on GNOME, bind this command to a shortcut in your desktop's setti
 
 Recording only stops when you press the shortcut a second time; there is no automatic silence detection. The first transcription may take longer because the model needs to download/load. Check the service logs if nothing happens.
 
+## Uninstall
+
+From the repo, run:
+
+```bash
+./uninstall.sh
+```
+
+This will:
+1. Stop and disable the `voice-to-text.service` user service, delete its unit file, and stop any running daemon.
+2. Remove the Voice to Text GNOME shortcut, keeping your other custom shortcuts.
+3. Disable and delete the overlay extension.
+4. Delete `app.py`, the venv and `daemon.log` from `~/.local/share/voice-to-text/`.
+
+Saved recordings (`recording-*.wav`) are kept by default. To also delete them and the downloaded Whisper models in `~/.cache/huggingface/hub`:
+
+```bash
+./uninstall.sh --purge
+```
+
+System packages installed by `install.sh` (`portaudio19-dev`, `wl-clipboard`, `wtype`, …) are left in place because other software may use them; remove them with `sudo apt remove` if you no longer need them. Log out and back in afterwards so GNOME Shell fully unloads the overlay.
+
 ## Configuration
 
 Re-run `./install.sh --no-apt --model ... --language ...`, or edit `~/.config/systemd/user/voice-to-text.service` and run `systemctl --user daemon-reload && systemctl --user restart voice-to-text.service`.
