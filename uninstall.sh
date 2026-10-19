@@ -56,7 +56,7 @@ rm -rf "$EXT_DIR"
 
 step "Removing app from $INSTALL_DIR"
 if [[ -d "$INSTALL_DIR" ]]; then
-    rm -rf "$INSTALL_DIR/venv" "$INSTALL_DIR/app.py" "$INSTALL_DIR/daemon.log"
+    rm -rf "$INSTALL_DIR/venv" "$INSTALL_DIR/app.py" "$INSTALL_DIR/daemon.log" "$INSTALL_DIR"/voice-to-text.log*
     if (( PURGE )); then
         rm -f "$INSTALL_DIR"/recording-*.wav
     fi

@@ -33,8 +33,11 @@ The first transcription downloads the selected Whisper model. `small` is a pract
 
 View logs:
 ```bash
-journalctl --user -u voice-to-text.service -f
+tail -f ~/.local/share/voice-to-text/voice-to-text.log   # detailed log from daemon + every toggle/cancel
+journalctl --user -u voice-to-text.service -f            # same, when running as the systemd service
 ```
+
+Logging defaults to `DEBUG`: device selection, mic levels every second, audio stats, model load, detected language, each Whisper segment, clipboard/paste results, timings, and full tracebacks. Set `VTT_LOG_LEVEL=INFO` (or `WARNING`) to quiet it. The file rotates at 5 MB (3 backups). `daemon.log` only catches raw stderr from an auto-started daemon (e.g. native library crashes).
 
 If you are not on GNOME, bind this command to a shortcut in your desktop's settings:
 ```bash
@@ -63,7 +66,7 @@ This will:
 1. Stop and disable the `voice-to-text.service` user service, delete its unit file, and stop any running daemon.
 2. Remove the Voice to Text GNOME shortcut, keeping your other custom shortcuts.
 3. Disable and delete the overlay extension.
-4. Delete `app.py`, the venv and `daemon.log` from `~/.local/share/voice-to-text/`.
+4. Delete `app.py`, the venv, `daemon.log` and `voice-to-text.log*` from `~/.local/share/voice-to-text/`.
 
 Saved recordings (`recording-*.wav`) are kept by default. To also delete them and the downloaded Whisper models in `~/.cache/huggingface/hub`:
 

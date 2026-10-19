@@ -34,7 +34,7 @@ Everything in Python lives in `app.py`; one process runs as the daemon, every ot
 
 - **Daemon (`app.py daemon`)** — `VoiceToTextDaemon` listens on a Unix socket at `$XDG_RUNTIME_DIR/voice-to-text.sock`. Plain-text commands: `toggle`, `cancel`, `status`. `toggle` spawns a worker thread (`record_and_transcribe`) that reads 50 ms blocks from `sounddevice` until `stop_event` is set, then saves a WAV under `~/.local/share/voice-to-text/`, transcribes (Whisper model is lazy-loaded on first use and cached), copies, and pastes. Recording only stops on a second `toggle` (no silence auto-stop).
 - **Client (`app.py toggle|cancel|status`)** — `send_command` connects to the socket. If `toggle` can't connect, `start_daemon` spawns a detached daemon (logging to `~/.local/share/voice-to-text/daemon.log`) guarded by an `flock` on `voice-to-text.lock` so rapid key presses don't start duplicates, then waits for the socket.
-- **Overlay (`gnome-extension/`)** — GNOME Shell extension (UUID `voice-to-text-overlay@local`, ESM, shell 46–50). It does **not** use the socket to learn state; it polls `$XDG_RUNTIME_DIR/voice-to-text.state` every 50 ms. The daemon writes that file atomically (`write_state`) as JSON `{state: idle|recording|processing, level, ts}` ~20×/s while recording. The overlay treats a `recording` state older than 1.5 s as stale (daemon died). Its X / ✓ buttons send `cancel` / `toggle` back over the socket.
+- **Overlay (`gnome-extension/`)** — GNOME Shell extension (UUID `voice-to-text-overlay@local`, ESM, shell 46–50). It does **not** use the socket to learn state; it polls `$XDG_RUNTIME_DIR/voice-to-text.state` every 50 ms. The daemon writes that file atomically (`write_state`) as JSON `{state: idle|recording|processing|error|warning, level, message, ts}` ~20×/s while recording. `processing` carries the current step in `message` ("Loading small model…", "Transcribing… 40%", "Pasting…"), shown as a shimmering label; when the worker ends with a problem it writes `error`/`warning` with a message instead of `idle`, which the overlay shows for 4 s (click to dismiss). The overlay treats a `recording` state older than 1.5 s as stale (daemon died). Its X / ✓ buttons send `cancel` / `toggle` back over the socket.
 
 When changing the state file format, socket path, or command names, update both `app.py` and `gnome-extension/extension.js`.
 
@@ -46,10 +46,11 @@ Two setups coexist; be aware which one a change affects:
 
 ## Configuration (env vars)
 
-`VTT_MODEL` (default `small`; `base`/`medium`), `VTT_LANGUAGE` (`auto`, `en`, `bn`), `VTT_COMPUTE_TYPE` (default `int8`), `VTT_DEVICE` (input device index or name; otherwise `pick_input_device` prefers the pulse/pipewire default source because raw ALSA hw devices reject 16 kHz).
+`VTT_MODEL` (default `small`; `base`/`medium`), `VTT_LANGUAGE` (`auto`, `en`, `bn`), `VTT_COMPUTE_TYPE` (default `int8`), `VTT_LOG_LEVEL` (default `DEBUG`), `VTT_DEVICE` (input device index or name; otherwise `pick_input_device` prefers the pulse/pipewire default source because raw ALSA hw devices reject 16 kHz).
 
 ## Notes
 
+- Logging uses the `logging` module (`log = logging.getLogger("voice-to-text")`), configured by `setup_logging(role)` in `main()`. All processes (daemon and clients) append to a rotating `~/.local/share/voice-to-text/voice-to-text.log`, tagged with role/pid/thread; stderr is added only for a TTY or systemd (`JOURNAL_STREAM`) so an auto-spawned daemon doesn't duplicate lines into `daemon.log`. Use `log.*`, not `print`, for diagnostics.
 - Desktop notifications (`notify-send`) have been intentionally disabled in favor of the overlay — the `notify(...)` calls in the worker are commented out. README.md still mentions `libnotify-bin`; it is no longer required.
 - `install-shortcut.sh` deliberately calls `/usr/bin/gsettings` to avoid a Linuxbrew `gsettings` that may target a different dconf.
 - Audio is passed to Whisper as a numpy array (not the WAV path) to avoid PyAV decoding.
