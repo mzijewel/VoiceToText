@@ -32,6 +32,7 @@ SAMPLE_RATE = 16000
 CHANNELS = 1
 BLOCK_SECONDS = 0.05
 LEVEL_LOG_SECONDS = 1.0  # how often to log a mic level summary while recording
+PASTE_ACK_TIMEOUT = 1.0  # seconds to wait for the overlay to confirm it pressed Ctrl+V (it polls every 50 ms)
 CONFIG_PATH = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "voice-to-text" / "config.json"
 # name -> (env var, default, allowed values or None for free-form)
 SETTING_SPECS: dict[str, tuple[str, str, tuple[str, ...] | None]] = {
@@ -221,12 +222,15 @@ class VoiceToTextDaemon:
         self.server: socket.socket | None = None
         self.cancelled = False
         self.last_state: tuple[str, str] | None = None
+        self.paste_id = 0
+        self.paste_acked = threading.Event()
         self.write_state("idle")
 
-    def write_state(self, state: str, level: float = 0.0, message: str = "") -> None:
+    def write_state(self, state: str, level: float = 0.0, message: str = "", **extra) -> None:
         """Publish state for the on-screen overlay (atomic replace so readers never see partial JSON).
 
-        States: idle, recording, processing (message = current step), error/warning (message shown briefly).
+        States: idle, recording, processing (message = current step), error/warning (message shown briefly),
+        pasting (extra id: the overlay presses Ctrl+V and replies "pasted <id>" over the socket).
         """
         if (state, message) != self.last_state:
             log.debug("State %s -> %s %r", self.last_state, state, message)
@@ -234,7 +238,7 @@ class VoiceToTextDaemon:
         tmp = STATE_PATH.with_suffix(".tmp")
         try:
             tmp.write_text(json.dumps(
-                {"state": state, "level": round(level, 3), "message": message, "ts": time.time()}
+                {"state": state, "level": round(level, 3), "message": message, "ts": time.time(), **extra}
             ))
             os.replace(tmp, STATE_PATH)
         except OSError as exc:
@@ -438,13 +442,9 @@ class VoiceToTextDaemon:
 
             # Give the clipboard manager a moment, then paste into the focused app.
             time.sleep(0.25)
-            paste = run_cmd(["wtype", "-M", "ctrl", "-P", "v", "-p", "v", "-m", "ctrl"], timeout=5)
-            if paste.returncode != 0:
+            if not self.paste():
                 # notify("Text copied, but auto-paste failed. Paste with Ctrl+V.", popup=True)
-                log.error("Auto-paste failed (wtype exit %d): %s", paste.returncode, paste.stderr.strip())
                 notice = ("warning", "Copied — auto-paste failed, press Ctrl+V")
-            else:
-                log.info("Pasted into focused app via wtype")
             total_seconds = time.perf_counter() - processing_start
             log.info("Transcription (%s): %s", info.language, text)
             log.info("Timing: audio %.1fs | model load %.2fs | transcribe %.2fs | cleanup %.2fs | "
@@ -465,6 +465,33 @@ class VoiceToTextDaemon:
                 self.write_state(notice[0], message=notice[1])
             else:
                 self.write_state("idle")
+
+    def paste(self) -> bool:
+        """Press Ctrl+V in the focused app.
+
+        GNOME's compositor has no virtual-keyboard protocol for wtype, so ask the overlay extension (running
+        inside gnome-shell) to inject the keys; fall back to wtype for other compositors or without the overlay.
+        """
+        self.paste_id += 1
+        self.paste_acked.clear()
+        self.write_state("pasting", message="Pasting…", id=self.paste_id)
+        if self.paste_acked.wait(PASTE_ACK_TIMEOUT):
+            log.info("Pasted into focused app via overlay")
+            return True
+        log.debug("Overlay did not confirm paste within %.1fs; trying wtype", PASTE_ACK_TIMEOUT)
+        paste = run_cmd(["wtype", "-M", "ctrl", "-P", "v", "-p", "v", "-m", "ctrl"], timeout=5)
+        if paste.returncode != 0:
+            log.error("Auto-paste failed (no overlay ack; wtype exit %d): %s", paste.returncode, paste.stderr.strip())
+            return False
+        log.info("Pasted into focused app via wtype")
+        return True
+
+    def paste_done(self, paste_id: str) -> str:
+        if paste_id == str(self.paste_id):
+            self.paste_acked.set()
+            return "ok"
+        log.warning("Ignoring paste ack %r (current paste id %d)", paste_id, self.paste_id)
+        return "stale"
 
     def serve(self) -> None:
         log.info("Daemon starting: python %s on %s, pid %d", platform.python_version(), platform.platform(), os.getpid())
@@ -498,6 +525,8 @@ class VoiceToTextDaemon:
                                                   "daemon pid": str(os.getpid())})
                     elif command == "reload":
                         result = self.reload_settings()
+                    elif command.startswith("pasted "):
+                        result = self.paste_done(command.removeprefix("pasted "))
                     else:
                         log.warning("Unknown command %r", command)
                         result = "unknown command"

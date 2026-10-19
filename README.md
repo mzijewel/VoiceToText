@@ -101,10 +101,10 @@ sudo apt install alsa-utils
 printf 'Hello from voice to text' | wl-copy
 wtype -M ctrl -P v -m ctrl
 ```
-Focus a text editor before running the second command.
+Focus a text editor before running the second command. (`wtype` does not work on GNOME; there the overlay extension does the paste.)
 
 ### Text copied but not pasted
-Some Wayland compositors restrict virtual keyboard input. The text remains in the clipboard; press Ctrl+V manually. GNOME on Wayland generally needs a compatible virtual-keyboard protocol for synthetic key events. If `wtype` reports a compositor/protocol error, use manual paste or configure a compositor-supported input tool.
+GNOME on Wayland has no virtual-keyboard protocol, so `wtype` fails there ("Compositor does not support the virtual keyboard protocol"). On GNOME the overlay extension presses Ctrl+V instead: make sure it is installed and enabled (`./install-overlay.sh`, then log out and back in). `wtype` is only used as a fallback on other compositors. Either way the text remains in the clipboard; press Ctrl+V manually if pasting fails.
 
 ### No microphone permission or no input device
 Check system Settings → Sound → Input. Close apps that may be holding an exclusive audio device, then restart the service.

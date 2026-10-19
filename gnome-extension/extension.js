@@ -1,7 +1,9 @@
 // On-screen pill for the voice-to-text daemon: cancel (X), live level bars, confirm (check) while
 // recording; a shimmering status label ("Loading model…", "Transcribing… 40%") while processing;
 // and a short-lived error/warning message when something goes wrong (click the pill to dismiss).
-// It polls the daemon's state file and talks back over the daemon's unix socket.
+// It polls the daemon's state file and talks back over the daemon's unix socket. It also presses Ctrl+V
+// (Ctrl+Shift+V in terminals) for the daemon (state "pasting"), since Mutter offers no virtual-keyboard
+// protocol to wtype.
 
 import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
@@ -18,12 +20,21 @@ const BAR_MIN = 3;
 const BAR_MAX = 20;
 const STALE_RECORDING_SECONDS = 1.5; // the daemon writes ~20x/s while recording
 const NOTICE_SECONDS = 4; // how long error/warning messages stay up
+const STALE_PASTE_SECONDS = 1; // the daemon gives up waiting for our ack after 1 s
 const SHIMMER_HALF_WIDTH = 28;
 const SHIMMER_STEP = 5; // px per poll tick
 
 const NOTICE_ICONS = {error: 'dialog-error-symbolic', warning: 'dialog-warning-symbolic'};
 const NOTICE_COLORS = {error: '#ff8a80', warning: '#ffd180'};
 const LABEL_STYLE = 'font-size: 10.5pt; padding: 0 12px; max-width: 460px;';
+// Terminals paste with Ctrl+Shift+V (Ctrl+V is a control character there); matched against the focused
+// window's lowercased WM_CLASS / app id.
+const TERMINAL_CLASSES = [
+    'dev.warp.warp', 'warp', 'gnome-terminal', 'org.gnome.terminal', 'org.gnome.ptyxis', 'ptyxis',
+    'org.gnome.console', 'kgx', 'kitty', 'alacritty', 'org.wezfurlong.wezterm', 'wezterm', 'ghostty',
+    'com.mitchellh.ghostty', 'tilix', 'com.gexperts.tilix', 'terminator', 'xfce4-terminal', 'konsole',
+    'org.kde.konsole', 'foot', 'xterm', 'urxvt', 'blackbox', 'com.raggesilver.blackbox', 'terminology',
+];
 
 const RUNTIME_DIR = GLib.getenv('XDG_RUNTIME_DIR') ?? `/tmp/voice-to-text-${GLib.getenv('UID') ?? ''}`;
 const STATE_FILE = Gio.File.new_for_path(`${RUNTIME_DIR}/voice-to-text.state`);
@@ -36,6 +47,9 @@ export default class VoiceToTextOverlay extends Extension {
         this._shownKey = null;
         this._dismissedTs = null;
         this._noticeTs = null;
+        this._pastedId = null;
+        this._keyboard = Clutter.get_default_backend().get_default_seat()
+            .create_virtual_device(Clutter.InputDeviceType.KEYBOARD_DEVICE);
         this._buildPill();
         this._timeoutId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, POLL_MS, () => {
             this._poll();
@@ -51,6 +65,7 @@ export default class VoiceToTextOverlay extends Extension {
         this._pill?.destroy();
         this._pill = null;
         this._bars = null;
+        this._keyboard = null;
     }
 
     _buildPill() {
@@ -132,6 +147,8 @@ export default class VoiceToTextOverlay extends Extension {
             const age = GLib.get_real_time() / 1e6 - (data.ts ?? 0);
             if (data.state === 'recording' && age > STALE_RECORDING_SECONDS)
                 return {state: 'idle', level: 0}; // daemon died mid-recording
+            if (data.state === 'pasting' && age > STALE_PASTE_SECONDS)
+                return {state: 'idle', level: 0}; // never paste a request the daemon already gave up on
             if (data.state in NOTICE_ICONS && (age > NOTICE_SECONDS || data.ts === this._dismissedTs))
                 return {state: 'idle', level: 0};
             return data;
@@ -147,8 +164,14 @@ export default class VoiceToTextOverlay extends Extension {
     }
 
     _poll() {
-        const {state, level, message, ts} = this._readState();
+        const {state, level, message, ts, id} = this._readState();
         this._tick++;
+
+        if (state === 'pasting' && id !== this._pastedId) {
+            this._pastedId = id;
+            this._pressCtrlV();
+            this._send(`pasted ${id}`);
+        }
 
         if (state === 'idle') {
             if (this._pill.visible)
@@ -202,6 +225,27 @@ export default class VoiceToTextOverlay extends Extension {
         this._pill.set_position(
             monitor.x + Math.floor((monitor.width - width) / 2),
             monitor.y + monitor.height - height - 48);
+    }
+
+    _focusedIsTerminal() {
+        const win = global.display.focus_window;
+        if (!win)
+            return false;
+        const ids = [win.get_wm_class(), win.get_wm_class_instance(), win.get_gtk_application_id()];
+        return ids.some(id => id && TERMINAL_CLASSES.includes(id.toLowerCase()));
+    }
+
+    _pressCtrlV() {
+        const time = GLib.get_monotonic_time();
+        const shift = this._focusedIsTerminal();
+        this._keyboard.notify_keyval(time, Clutter.KEY_Control_L, Clutter.KeyState.PRESSED);
+        if (shift)
+            this._keyboard.notify_keyval(time, Clutter.KEY_Shift_L, Clutter.KeyState.PRESSED);
+        this._keyboard.notify_keyval(time, Clutter.KEY_v, Clutter.KeyState.PRESSED);
+        this._keyboard.notify_keyval(time, Clutter.KEY_v, Clutter.KeyState.RELEASED);
+        if (shift)
+            this._keyboard.notify_keyval(time, Clutter.KEY_Shift_L, Clutter.KeyState.RELEASED);
+        this._keyboard.notify_keyval(time, Clutter.KEY_Control_L, Clutter.KeyState.RELEASED);
     }
 
     _send(command) {
