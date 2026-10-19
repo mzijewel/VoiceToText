@@ -10,6 +10,7 @@ import logging.handlers
 import os
 import platform
 import queue
+import shutil
 import socket
 import subprocess
 import sys
@@ -39,11 +40,14 @@ SETTING_SPECS: dict[str, tuple[str, str, tuple[str, ...] | None]] = {
     "compute_type": ("VTT_COMPUTE_TYPE", "int8", ("int8", "int8_float32", "int16", "float32")),
     "device": ("VTT_DEVICE", "auto", None),  # input device index or name; see `app.py devices`
     "log_level": ("VTT_LOG_LEVEL", "DEBUG", ("DEBUG", "INFO", "WARNING", "ERROR")),
-    "cleanup": ("VTT_CLEANUP", "off", ("off", "on")),  # polish the transcript with a local Ollama model
-    "cleanup_model": ("VTT_CLEANUP_MODEL", "gemma4:e4b", None),
+    "cleanup": ("VTT_CLEANUP", "off", ("off", "ollama", "claude")),  # polish the transcript with an LLM
+    "ollama_model": ("VTT_OLLAMA_MODEL", "gemma4:e4b", None),
     "ollama_url": ("VTT_OLLAMA_URL", "http://localhost:11434", None),
+    "claude_model": ("VTT_CLAUDE_MODEL", "haiku", None),  # alias (haiku/sonnet/opus) or full model id
 }
-CLEANUP_TIMEOUT = 60  # seconds; covers a cold model load on CPU
+CLEANUP_TIMEOUT = 60  # seconds; covers a cold Ollama model load on CPU
+CLAUDE_TIMEOUT = 20  # a normal call takes ~3s; offline the CLI retries for minutes, so give up and fall back
+CLAUDE_HOST = ("api.anthropic.com", 443)
 CLEANUP_PROMPT = (
     "You clean up speech-to-text transcripts. The user message is a raw transcript inside <transcript> tags. "
     "Fix punctuation, capitalization, spacing and obvious mis-heard words; remove filler words (um, uh) and "
@@ -79,6 +83,8 @@ def load_settings() -> tuple[dict[str, str], dict[str, str]]:
         else:
             values[name], sources[name] = default, "default"
     values["log_level"] = values["log_level"].upper()
+    if values["cleanup"] == "on":  # older configs had a single on/off switch for Ollama
+        values["cleanup"] = "ollama"
     return values, sources
 
 
@@ -279,8 +285,8 @@ class VoiceToTextDaemon:
             self.stop_event = threading.Event()
             self.worker = threading.Thread(target=self.record_and_transcribe, name="recorder", daemon=True)
             self.worker.start()
-            if SETTINGS["cleanup"] == "on":
-                threading.Thread(target=preload_cleanup_model, name="cleanup-preload", daemon=True).start()
+            if SETTINGS["cleanup"] != "off":
+                threading.Thread(target=prepare_cleanup, name="cleanup-preload", daemon=True).start()
             return "Recording started. Press the shortcut again to finish."
 
     def record_and_transcribe(self) -> None:
@@ -403,11 +409,13 @@ class VoiceToTextDaemon:
                 return
 
             cleanup_seconds = 0.0
-            if SETTINGS["cleanup"] == "on":
+            if SETTINGS["cleanup"] != "off":
                 self.write_state("processing", message="Polishing…")
                 cleanup_start = time.perf_counter()
                 try:
-                    text = cleanup_text(text)
+                    text, used = cleanup_text(text)
+                    if used != SETTINGS["cleanup"]:
+                        notice = ("warning", "Claude unavailable — used local model")
                 except Exception as exc:
                     log.warning("Cleanup failed, using raw transcript: %s", exc)
                     notice = ("warning", "Cleanup failed — pasted raw text")
@@ -557,7 +565,7 @@ def start_daemon(timeout: float = 30) -> None:
 
 def ollama_chat(messages: list[dict[str, str]], timeout: float) -> str:
     body = {
-        "model": SETTINGS["cleanup_model"], "messages": messages, "stream": False,
+        "model": SETTINGS["ollama_model"], "messages": messages, "stream": False,
         "think": False, "keep_alive": "30m", "options": {"temperature": 0},
     }
     request = urllib.request.Request(
@@ -568,26 +576,84 @@ def ollama_chat(messages: list[dict[str, str]], timeout: float) -> str:
         return json.load(response).get("message", {}).get("content", "")
 
 
-def preload_cleanup_model() -> None:
-    """Load the Ollama model while the user is still speaking (a chat with no messages just loads it)."""
+def claude_reachable(timeout: float = 2) -> bool:
+    try:
+        socket.create_connection(CLAUDE_HOST, timeout=timeout).close()
+        return True
+    except OSError as exc:
+        log.warning("Claude API unreachable (%s:%d): %s", *CLAUDE_HOST, exc)
+        return False
+
+
+def prepare_cleanup() -> None:
+    """Runs while the user is still speaking: load the Ollama model if it is (or may be) going to be used."""
+    if SETTINGS["cleanup"] == "claude" and claude_reachable():
+        return
+    preload_ollama_model()
+
+
+def preload_ollama_model() -> None:
+    """A chat with no messages just loads the model."""
     start = time.perf_counter()
     try:
         ollama_chat([], timeout=CLEANUP_TIMEOUT)
-        log.debug("Cleanup model %s ready in %.2fs", SETTINGS["cleanup_model"], time.perf_counter() - start)
+        log.debug("Ollama model %s ready in %.2fs", SETTINGS["ollama_model"], time.perf_counter() - start)
     except Exception as exc:
-        log.warning("Could not preload cleanup model %s: %s", SETTINGS["cleanup_model"], exc)
+        log.warning("Could not preload Ollama model %s: %s", SETTINGS["ollama_model"], exc)
 
 
-def cleanup_text(text: str) -> str:
-    """Polish a transcript with the local LLM; raises on failure or a suspicious rewrite."""
+def find_claude() -> str:
+    # The auto-spawned daemon may not inherit a PATH containing ~/.local/bin.
+    path = shutil.which("claude") or str(Path.home() / ".local" / "bin" / "claude")
+    if not os.access(path, os.X_OK):
+        raise FileNotFoundError("claude CLI not found (install Claude Code or put it on PATH)")
+    return path
+
+
+def claude_complete(transcript: str, timeout: float) -> str:
+    """One-shot Claude Code call, stripped down: no tools, MCP, settings/hooks, skills or saved session."""
+    env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}  # allow running inside a Claude Code shell
+    result = subprocess.run(
+        [find_claude(), "-p", "--model", SETTINGS["claude_model"], "--system-prompt", CLEANUP_PROMPT,
+         "--tools", "", "--strict-mcp-config", "--setting-sources", "", "--no-session-persistence",
+         "--disable-slash-commands"],
+        input=transcript, text=True, capture_output=True, timeout=timeout, check=False,
+        cwd=APP_DIR, env=env,  # a neutral cwd so no project CLAUDE.md is loaded
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"claude exited {result.returncode}: {(result.stderr or result.stdout).strip()[:200]}")
+    return result.stdout
+
+
+def cleanup_text(text: str) -> tuple[str, str]:
+    """Polish a transcript, falling back from Claude to Ollama; returns (text, provider used) or raises."""
+    providers = ["claude", "ollama"] if SETTINGS["cleanup"] == "claude" else ["ollama"]
+    for provider in providers:
+        try:
+            return cleanup_with(provider, text), provider
+        except Exception as exc:
+            if provider == providers[-1]:
+                raise
+            log.warning("Cleanup with %s failed (%s); falling back to %s", provider, exc, providers[-1])
+    raise AssertionError("unreachable")
+
+
+def cleanup_with(provider: str, text: str) -> str:
+    """Polish a transcript with one LLM provider; raises on failure or a suspicious rewrite."""
+    model = SETTINGS["claude_model"] if provider == "claude" else SETTINGS["ollama_model"]
+    transcript = f"<transcript>{text}</transcript>"
     start = time.perf_counter()
-    cleaned = ollama_chat(
-        [{"role": "system", "content": CLEANUP_PROMPT},
-         {"role": "user", "content": f"<transcript>{text}</transcript>"}],
-        timeout=CLEANUP_TIMEOUT,
-    ).strip()
-    cleaned = cleaned.removeprefix("<transcript>").removesuffix("</transcript>").strip()
-    log.info("Cleanup (%s) in %.2fs: %r -> %r", SETTINGS["cleanup_model"], time.perf_counter() - start, text, cleaned)
+    if provider == "claude":
+        if not claude_reachable():
+            raise ConnectionError("no connection to the Claude API")
+        cleaned = claude_complete(transcript, timeout=CLAUDE_TIMEOUT)
+    else:
+        cleaned = ollama_chat(
+            [{"role": "system", "content": CLEANUP_PROMPT}, {"role": "user", "content": transcript}],
+            timeout=CLEANUP_TIMEOUT,
+        )
+    cleaned = cleaned.strip().removeprefix("<transcript>").removesuffix("</transcript>").strip()
+    log.info("Cleanup (%s %s) in %.2fs: %r -> %r", provider, model, time.perf_counter() - start, text, cleaned)
     # A cleanup only tidies; a much shorter/longer reply means the model answered or rambled instead.
     if not cleaned or not 0.5 <= len(cleaned) / len(text) <= 1.6:
         raise ValueError(f"unexpected cleanup output ({len(text)} -> {len(cleaned)} chars)")
@@ -615,7 +681,7 @@ def change_setting(name: str, value: str | None) -> int:
         if choices and value not in choices:
             print(f"Invalid {name} {value!r}; choose from: {', '.join(choices)}", file=sys.stderr)
             return 2
-        if name == "cleanup_model":
+        if name == "ollama_model":
             try:
                 with urllib.request.urlopen(SETTINGS["ollama_url"].rstrip("/") + "/api/tags", timeout=3) as response:
                     installed = [m["name"] for m in json.load(response).get("models", [])]
