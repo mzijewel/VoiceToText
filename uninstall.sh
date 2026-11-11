@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Removes what install.sh set up: service, GNOME shortcut, overlay extension, app + venv.
-# System packages are left installed since other software may use them.
+# Removes what the installer set up, on any OS. Linux: service, GNOME shortcut, overlay extension,
+# app + venv (system packages are left installed). macOS / Windows (Git Bash): delegates to
+# install-macos.sh --uninstall / install-windows.ps1 -Uninstall.
 #
 # Usage: ./uninstall.sh [--purge]
 #   --purge  also delete saved recordings, saved settings and the downloaded Whisper models
@@ -20,11 +21,20 @@ PURGE=0
 case "${1:-}" in
     --purge) PURGE=1 ;;
     "") ;;
-    -h|--help) sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "Unknown option: $1" >&2; exit 1 ;;
 esac
 
 step() { printf '\n==> %s\n' "$*"; }
+
+# Other platforms: hand off to their installer's uninstall mode.
+DIR="$(cd "$(dirname "$0")" && pwd)"
+case "$(uname -s)" in
+    Darwin)
+        exec "$DIR/install-macos.sh" --uninstall $( ((PURGE)) && echo --purge ) ;;
+    MINGW*|MSYS*|CYGWIN*)
+        exec powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$(cygpath -w "$DIR/install-windows.ps1")" -Uninstall $( ((PURGE)) && echo -Purge ) ;;
+esac
 
 step "Stopping daemon and removing systemd user service"
 if [[ -f "$SERVICE" ]]; then
@@ -48,8 +58,10 @@ if [[ -x "$SYSTEM_GSETTINGS" ]]; then
     done
 fi
 
-step "Removing 'vtt' alias from ~/.bashrc"
-[[ -f "$HOME/.bashrc" ]] && sed -i '/^# >>> voice-to-text >>>$/,/^# <<< voice-to-text <<<$/d' "$HOME/.bashrc"
+step "Removing 'vtt' alias from ~/.bashrc and ~/.zshrc"
+for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+    if [[ -f "$rc" ]]; then sed -i '/^# >>> voice-to-text >>>$/,/^# <<< voice-to-text <<<$/d' "$rc"; fi
+done
 
 step "Removing overlay extension"
 if command -v gnome-extensions >/dev/null; then
