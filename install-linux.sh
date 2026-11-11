@@ -2,7 +2,7 @@
 # One-shot installer: system packages, app + venv under ~/.local/share/voice-to-text,
 # systemd user service, GNOME global shortcut, and the on-screen overlay extension.
 #
-# Usage: ./install.sh [--key '<Ctrl><Alt>space'] [--model small] [--language auto]
+# Usage: ./install.sh [--key '<Ctrl><Alt>space'] [--model base] [--language auto]
 #                     [--no-apt] [--no-service] [--no-overlay]
 set -euo pipefail
 
@@ -12,7 +12,7 @@ VENV="$INSTALL_DIR/venv"
 SERVICE_DIR="$HOME/.config/systemd/user"
 
 KEY='<Ctrl><Alt>space'
-MODEL=small
+MODEL=base
 LANGUAGE=auto
 DO_APT=1
 DO_SERVICE=1
@@ -57,6 +57,10 @@ step "Setting up Python venv and dependencies"
 "$VENV/bin/pip" install --quiet --upgrade pip
 "$VENV/bin/pip" install --quiet faster-whisper sounddevice numpy
 
+step "Downloading the '$MODEL' Whisper model (one time)"
+"$VENV/bin/python" -c 'from faster_whisper.utils import download_model; import sys; download_model(sys.argv[1])' "$MODEL" \
+    || echo "Model download failed; it will be retried on the first transcription." >&2
+
 if (( DO_SERVICE )); then
     step "Installing systemd user service"
     mkdir -p "$SERVICE_DIR"
@@ -99,7 +103,6 @@ fi
 
 step "Done"
 echo "Press $KEY to start recording, press again to transcribe and paste."
-echo "The first transcription downloads the '$MODEL' Whisper model, so it will be slow."
 echo "Settings: vtt settings | vtt set language bn | vtt devices   (open a new terminal or: source ~/.bashrc)"
 (( DO_SERVICE )) && echo "Logs: journalctl --user -u voice-to-text.service -f"
 exit 0

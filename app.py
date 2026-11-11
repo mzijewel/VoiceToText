@@ -61,11 +61,11 @@ LEVEL_LOG_SECONDS = 1.0  # how often to log a mic level summary while recording
 PASTE_ACK_TIMEOUT = 1.0  # seconds to wait for the overlay to confirm it pressed Ctrl+V (it polls every 50 ms)
 CONFIG_PATH = CONFIG_DIR / "config.json"
 # GNOME binds the shortcut itself; elsewhere the daemon listens for it (pynput key syntax).
-DEFAULT_HOTKEY = "off" if IS_LINUX else "<ctrl>+<alt>+<space>"
+DEFAULT_HOTKEY = "off" if IS_LINUX else "<cmd>+<shift>+<space>" if IS_MAC else "<ctrl>+<alt>+<space>"
 NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if IS_WINDOWS else {}  # no console flash
 # name -> (env var, default, allowed values or None for free-form)
 SETTING_SPECS: dict[str, tuple[str, str, tuple[str, ...] | None]] = {
-    "model": ("VTT_MODEL", "small", ("tiny", "base", "small", "medium", "large-v3", "turbo")),
+    "model": ("VTT_MODEL", "base", ("tiny", "base", "small", "medium", "large-v3", "turbo")),
     "language": ("VTT_LANGUAGE", "auto", ("auto", "en", "bn")),
     "compute_type": ("VTT_COMPUTE_TYPE", "int8", ("int8", "int8_float32", "int16", "float32")),
     "device": ("VTT_DEVICE", "auto", None),  # input device index or name; see `app.py devices`
@@ -374,6 +374,20 @@ def validate_hotkey(combo: str) -> None:
     keyboard.HotKey.parse(combo)
 
 
+def request_mac_permissions() -> None:
+    """Ask macOS for Accessibility + Input Monitoring (shows the system prompts the first time)."""
+    try:
+        import ApplicationServices as ax
+        import Quartz
+        trusted = ax.AXIsProcessTrustedWithOptions({ax.kAXTrustedCheckOptionPrompt: True})
+        listen = Quartz.CGPreflightListenEventAccess() or Quartz.CGRequestListenEventAccess()
+        if not (trusted and listen):
+            log.warning("Missing permission (accessibility=%s, input monitoring=%s): allow VoiceToText under "
+                        "Privacy & Security, then restart the daemon", bool(trusted), bool(listen))
+    except Exception:
+        log.exception("Could not check macOS permissions")
+
+
 class GlobalHotkey:
     """Calls `callback` whenever `combo` is pressed in any app.
 
@@ -398,8 +412,8 @@ class GlobalHotkey:
             self.listener.start()
             log.info("Listening for hotkey %s", combo)
             if IS_MAC:
-                log.info("If the hotkey does nothing, allow %s under Privacy & Security > Accessibility and "
-                         "Input Monitoring", sys.executable)
+                log.info("If the hotkey does nothing, allow VoiceToText (or %s) under Privacy & Security > "
+                         "Accessibility and Input Monitoring", sys.executable)
 
     def _pressed(self) -> None:
         log.info("Hotkey %s pressed", self.combo)
@@ -479,6 +493,8 @@ class VoiceToTextDaemon:
             self.hotkey = None
         if combo == "off":
             return
+        if IS_MAC:
+            request_mac_permissions()
         try:
             self.hotkey = GlobalHotkey(combo, self.toggle)
         except ImportError:

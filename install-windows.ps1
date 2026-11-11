@@ -2,7 +2,7 @@
 # the daemon at login, and a vtt.cmd helper. The daemon itself registers the global hotkey.
 #
 # Usage: powershell -ExecutionPolicy Bypass -File install-windows.ps1 [-Key '<ctrl>+<alt>+<space>']
-#            [-Model small] [-Language auto] [-NoAutostart]
+#            [-Model base] [-Language auto] [-NoAutostart]
 #        powershell -ExecutionPolicy Bypass -File install-windows.ps1 -Uninstall [-Purge]
 param(
     [string]$Key = "",
@@ -74,6 +74,12 @@ if ($LASTEXITCODE) { throw "pip install failed" }
 
 if ($Key) { & $Python $App set hotkey $Key }
 if ($Model) { & $Python $App set model $Model }
+$WhisperModel = "base"
+$m = (& $Python $App settings | Select-String '^model\s+(\S+)')
+if ($m) { $WhisperModel = $m.Matches[0].Groups[1].Value }
+Step "Downloading the '$WhisperModel' Whisper model (one time)"
+& $Python -c "from faster_whisper.utils import download_model; import sys; download_model(sys.argv[1])" $WhisperModel
+if ($LASTEXITCODE) { Write-Warning "Model download failed; it will be retried on the first transcription." }
 if ($Language) { & $Python $App set language $Language }
 
 Step "Creating vtt.cmd"
@@ -95,7 +101,6 @@ if (-not $NoAutostart) {
 $Hotkey = (& $Python $App settings | Select-String '^hotkey\s+(\S+)').Matches.Groups[1].Value
 Step "Done"
 Write-Host "Press $Hotkey to start recording, press again to transcribe and paste."
-Write-Host "The first transcription downloads the Whisper model, so it will be slow."
 Write-Host "Settings: `"$InstallDir\vtt.cmd`" settings | set language bn | devices"
 Write-Host "  (add $InstallDir to your PATH to just type: vtt settings)"
 Write-Host "Logs: Get-Content -Wait `"$InstallDir\voice-to-text.log`""

@@ -33,7 +33,9 @@ Options:
 
 Re-run `./install.sh --no-apt` after changing `app.py` to copy it over and restart the service.
 
-The first transcription downloads the selected Whisper model. `small` is a practical CPU starting point; `base` uses fewer resources, `medium` may recognize better at higher CPU/RAM cost. The model runs locally after download.
+The installer downloads the selected Whisper model once (if that fails, the first transcription retries it). `base` (~145 MB) is the default and a light CPU starting point; `small` (~480 MB) and `medium` may recognize better at higher CPU/RAM cost. The model runs locally after download.
+
+Models are stored in the Hugging Face cache, on every OS: `~/.cache/huggingface/hub/models--Systran--faster-whisper-<size>/` (`$HF_HOME/hub/` if `HF_HOME` is set; `%USERPROFILE%\.cache\huggingface\hub` on Windows). List them with `ls ~/.cache/huggingface/hub`; `uninstall.sh --purge` deletes them.
 
 View logs:
 ```bash
@@ -84,7 +86,7 @@ Uninstall: `install-windows.ps1 -Uninstall` (add `-Purge` to also delete recordi
 
 ### Hotkey and settings on macOS/Windows
 
-The default hotkey is **Ctrl+Alt+Space**. Change it with `vtt set hotkey '<cmd>+<shift>+<space>'` (pynput
+The default hotkey is **Cmd+Shift+Space** on macOS and **Ctrl+Alt+Space** on Windows. Change it with `vtt set hotkey '<cmd>+<shift>+<space>'` (pynput
 syntax: `<ctrl>`, `<alt>`, `<shift>`, `<cmd>`, plus a letter, digit, `<space>`, `<f1>`…); `vtt set hotkey off`
 disables it. `vtt set sounds off` silences the beeps. All other `vtt` commands work as on Linux. You can also
 run the daemon in the foreground with `python app.py daemon` to watch its log.
@@ -96,7 +98,7 @@ run the daemon in the foreground with `python app.py daemon` to watch its log.
 - Press it again (or click the check mark on the overlay) to finish; click X to cancel.
 - The recognized text is copied to the clipboard and pasted with Ctrl+V (Cmd+V on macOS).
 
-Recording only stops when you press the shortcut a second time; there is no automatic silence detection. The first transcription may take longer because the model needs to download/load. Check the service logs if nothing happens.
+Recording only stops when you press the shortcut a second time; there is no automatic silence detection. The first transcription may take a moment longer while the model loads. Check the service logs if nothing happens.
 
 ## Uninstall
 
@@ -146,11 +148,11 @@ Values are saved in `~/.config/voice-to-text/config.json` (`%APPDATA%\voice-to-t
 
 | Setting | Env var | Default | Values |
 |---|---|---|---|
-| `model` | `VTT_MODEL` | `small` | `tiny`, `base`, `small`, `medium`, `large-v3`, `turbo` |
+| `model` | `VTT_MODEL` | `base` | `tiny`, `base`, `small`, `medium`, `large-v3`, `turbo` |
 | `language` | `VTT_LANGUAGE` | `auto` | `auto` (detect), `en`, `bn` |
 | `compute_type` | `VTT_COMPUTE_TYPE` | `int8` | `int8`, `int8_float32`, `int16`, `float32` |
 | `device` | `VTT_DEVICE` | `auto` | input device index or name (see `vtt devices`) |
-| `hotkey` | `VTT_HOTKEY` | `off` on Linux, `<ctrl>+<alt>+<space>` elsewhere | pynput syntax, or `off` |
+| `hotkey` | `VTT_HOTKEY` | `off` on Linux, `<cmd>+<shift>+<space>` on macOS, `<ctrl>+<alt>+<space>` on Windows | pynput syntax, or `off` |
 | `sounds` | `VTT_SOUNDS` | `off` on Linux, `on` elsewhere | `on`, `off` |
 | `cleanup` | `VTT_CLEANUP` | `off` | `off`, `ollama`, `claude` (LLM tidy-up of the transcript) |
 | `ollama_model` / `ollama_url` | `VTT_OLLAMA_MODEL` / `VTT_OLLAMA_URL` | `gemma4:e4b` / `http://localhost:11434` | any |
@@ -184,7 +186,7 @@ GNOME on Wayland has no virtual-keyboard protocol, so `wtype` fails there ("Comp
 Check system Settings → Sound → Input. Close apps that may be holding an exclusive audio device, then restart the service.
 
 ### Model or CPU resource problems
-Use a smaller/faster model: `./install.sh --no-apt --model base`.
+Use a smaller/faster model: `./install.sh --no-apt --model tiny`.
 
 ## Privacy
 

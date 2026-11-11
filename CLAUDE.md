@@ -51,11 +51,11 @@ When changing the state file format, socket path, or command names, update both 
 Platform checks use `IS_LINUX` / `IS_MAC` / `IS_WINDOWS`; keep Linux behaviour unchanged when touching them.
 - **Paths** (`platform_dirs`): Linux XDG dirs as above; macOS everything in `~/Library/Application Support/voice-to-text`; Windows data/runtime in `%LOCALAPPDATA%\voice-to-text`, config in `%APPDATA%\voice-to-text`.
 - **IPC**: Python has no AF_UNIX on Windows, so the daemon listens on `127.0.0.1:<ephemeral>` and writes the port to `voice-to-text.port` (`connect_daemon`). The startup lock uses `msvcrt.locking` there instead of `flock`; the auto-spawned daemon uses `pythonw.exe` + `CREATE_NO_WINDOW`, and `main` redirects a missing stderr to `daemon.log`.
-- **Hotkey**: GNOME binds its own shortcut, so `hotkey` defaults to `off` on Linux. Elsewhere `GlobalHotkey` runs in the daemon: Windows `RegisterHotKey` in a message-loop thread (no deps), otherwise `pynput.GlobalHotKeys` (macOS needs Accessibility + Input Monitoring). Changing `hotkey` restarts it on `reload`.
+- **Hotkey**: GNOME binds its own shortcut, so `hotkey` defaults to `off` on Linux (`<cmd>+<shift>+<space>` on macOS, `<ctrl>+<alt>+<space>` on Windows). Elsewhere `GlobalHotkey` runs in the daemon: Windows `RegisterHotKey` in a message-loop thread (no deps), otherwise `pynput.GlobalHotKeys` (macOS needs Accessibility + Input Monitoring). Changing `hotkey` restarts it on `reload`.
 - **Clipboard/paste**: `copy_to_clipboard` (macOS `pbcopy` with `LC_CTYPE=UTF-8`, Windows Win32 `CF_UNICODETEXT` via ctypes) and `press_paste_keys` (macOS `osascript` Cmd+V, Windows `keybd_event` Ctrl+V); `paste()` skips the overlay handshake off Linux.
 - **macOS overlay**: the daemon spawns `app.py overlay <daemon pid>` (`run_mac_overlay`, PyObjC/AppKit — already installed via pynput): a non-activating bottom-center pill that polls the same state file and exits when the daemon dies.
 - **Feedback without the overlay**: `play_cue` beeps on start/stop/problem (`sounds`, default on off Linux), and error/warning notices also go to `notify(..., popup=True)` (macOS `osascript` notification, Windows PowerShell balloon).
-- **Autostart**: macOS LaunchAgent `local.voice-to-text`; Windows Startup-folder shortcut to `pythonw app.py daemon`.
+- **Autostart**: macOS LaunchAgent `local.voice-to-text` runs `VoiceToText.app` (a bundle made by `install-macos.sh` whose executable is a native launcher built from `macos-icon/launcher.c` that embeds the venv's Python, so the process itself is VoiceToText and Accessibility/Input Monitoring/Microphone are granted to it; the daemon calls `request_mac_permissions` to trigger the prompts; Settings shows the name and `macos-icon/AppIcon.icns` instead of "python"; regenerate the icon with `macos-icon/make-icon.py`); Windows Startup-folder shortcut to `pythonw app.py daemon`.
 
 ## Deployment modes
 
@@ -67,7 +67,7 @@ Two setups coexist; be aware which one a change affects:
 
 Resolved by `load_settings()` per setting as config file (`~/.config/voice-to-text/config.json`, written by `app.py set`) > env var > default; `SETTING_SPECS` lists names, env vars, defaults and allowed values. The daemon re-reads on the `reload` socket command (sent by `set`/`reset`); a changed model/compute_type is loaded on the next transcription.
 
-`VTT_MODEL` (default `small`; `base`/`medium`), `VTT_LANGUAGE` (`auto`, `en`, `bn`), `VTT_COMPUTE_TYPE` (default `int8`), `VTT_LOG_LEVEL` (default `DEBUG`), `VTT_DEVICE` (input device index or name; otherwise `pick_input_device` prefers the pulse/pipewire default source on Linux because raw ALSA hw devices reject 16 kHz, and the system default elsewhere), `VTT_HOTKEY`, `VTT_SOUNDS`.
+`VTT_MODEL` (default `base`; `small`/`medium`), `VTT_LANGUAGE` (`auto`, `en`, `bn`), `VTT_COMPUTE_TYPE` (default `int8`), `VTT_LOG_LEVEL` (default `DEBUG`), `VTT_DEVICE` (input device index or name; otherwise `pick_input_device` prefers the pulse/pipewire default source on Linux because raw ALSA hw devices reject 16 kHz, and the system default elsewhere), `VTT_HOTKEY`, `VTT_SOUNDS`.
 
 ## Notes
 
