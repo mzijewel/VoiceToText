@@ -189,6 +189,7 @@ def pick_input_device() -> int | str | None:
     # PortAudio snapshots devices and its PulseAudio connection at init; re-init so a PipeWire
     # restart or a hot-plugged mic doesn't leave the long-running daemon with a dead stream.
     start = time.perf_counter()
+    sd.stop()  # close the previous cue's sd.play stream first; terminating under it kills later input streams
     sd._terminate()
     sd._initialize()
     log.debug("Re-initialized PortAudio in %.3fs", time.perf_counter() - start)
@@ -1058,12 +1059,123 @@ def change_setting(name: str, value: str | None) -> int:
     return 0
 
 
+def run_mac_overlay(parent_pid: int) -> None:
+    """macOS on-screen indicator: a small non-activating pill that follows the daemon's state file.
+
+    Runs as its own process (AppKit needs the main thread) and exits when the daemon does.
+    """
+    import objc
+    from Quartz import CGColorCreateGenericGray, CGColorCreateGenericRGB
+    from AppKit import (NSApplication, NSApplicationActivationPolicyAccessory, NSBackingStoreBuffered, NSColor,
+                        NSFont, NSMakeRect, NSPanel, NSScreen, NSTextField, NSView,
+                        NSWindowCollectionBehaviorCanJoinAllSpaces, NSWindowCollectionBehaviorFullScreenAuxiliary,
+                        NSWindowStyleMaskBorderless, NSWindowStyleMaskNonactivatingPanel, NSStatusWindowLevel)
+    from Foundation import NSObject, NSTimer
+
+    width, height, notice_seconds = 260.0, 44.0, 4.0
+    app = NSApplication.sharedApplication()
+    app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)  # no Dock icon, never steals focus
+
+    panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+        NSMakeRect(0, 0, width, height),
+        NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel, NSBackingStoreBuffered, False)
+    panel.setLevel_(NSStatusWindowLevel)
+    panel.setOpaque_(False)
+    panel.setBackgroundColor_(NSColor.clearColor())
+    panel.setHasShadow_(True)
+    panel.setIgnoresMouseEvents_(True)
+    panel.setHidesOnDeactivate_(False)
+    panel.setCollectionBehavior_(NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorFullScreenAuxiliary)
+
+    pill = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, width, height))
+    pill.setWantsLayer_(True)
+    pill.layer().setCornerRadius_(height / 2)
+    pill.layer().setBackgroundColor_(CGColorCreateGenericGray(0.08, 0.92))
+    panel.setContentView_(pill)
+
+    dot = NSView.alloc().initWithFrame_(NSMakeRect(16, (height - 12) / 2, 12, 12))
+    dot.setWantsLayer_(True)
+    dot.layer().setCornerRadius_(6)
+    pill.addSubview_(dot)
+
+    label = NSTextField.alloc().initWithFrame_(NSMakeRect(38, (height - 20) / 2, width - 54, 20))
+    label.setEditable_(False)
+    label.setBordered_(False)
+    label.setDrawsBackground_(False)
+    label.setTextColor_(NSColor.whiteColor())
+    label.setFont_(NSFont.systemFontOfSize_weight_(14, 0.3))
+    pill.addSubview_(label)
+
+    colors = {"recording": (1.0, 0.27, 0.23), "processing": (1.0, 0.8, 0.0),
+              "pasting": (1.0, 0.8, 0.0), "error": (1.0, 0.27, 0.23), "warning": (1.0, 0.62, 0.04)}
+    shown = {"key": None, "since": 0.0}
+
+    def place() -> None:
+        frame = NSScreen.mainScreen().visibleFrame()
+        panel.setFrameOrigin_((frame.origin.x + (frame.size.width - width) / 2, frame.origin.y + 48))
+
+    def refresh() -> None:
+        try:
+            state = json.loads(STATE_PATH.read_text())
+        except (OSError, ValueError):
+            return
+        name, message, now = state.get("state", "idle"), state.get("message", ""), time.time()
+        if name == "recording" and now - state.get("ts", 0) > 1.5:
+            name = "idle"  # daemon died mid-recording
+        if name in ("error", "warning") and now - state.get("ts", now) > notice_seconds:
+            name = "idle"
+        if name == "idle" or name not in colors:
+            shown["key"] = None
+            if panel.isVisible():
+                panel.orderOut_(None)
+            return
+        if name == "recording":
+            level = float(state.get("level", 0))
+            if shown["key"] != "recording":
+                shown["since"] = now
+            elapsed = int(now - shown["since"])
+            text, alpha = f"Recording  {elapsed // 60}:{elapsed % 60:02d}", 0.55 + 0.45 * min(1.0, level)
+        else:
+            text, alpha = message or "Working…", 1.0
+        shown["key"] = name
+        r, g, b = colors[name]
+        dot.layer().setBackgroundColor_(CGColorCreateGenericRGB(r, g, b, alpha))
+        if label.stringValue() != text:
+            label.setStringValue_(text)
+        if not panel.isVisible():
+            place()
+            panel.orderFrontRegardless()
+
+    class Ticker(NSObject):
+        def tick_(self, _timer):
+            if os.getppid() != parent_pid:
+                app.terminate_(None)
+                return
+            refresh()
+
+    ticker = Ticker.alloc().init()
+    NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+        0.05, ticker, objc.selector(ticker.tick_, signature=b"v@:@"), None, True)
+    log.info("Overlay running")
+    app.run()
+
+
+def start_mac_overlay() -> None:
+    """Spawn the overlay process alongside the daemon (macOS only)."""
+    try:
+        subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "overlay", str(os.getpid())],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except OSError:
+        log.exception("Could not start the overlay")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Local voice-to-text (Linux/Wayland, macOS, Windows)",
         epilog="examples: app.py settings | app.py set language bn | app.py reset language | app.py devices",
     )
-    parser.add_argument("command", choices=["daemon", "toggle", "cancel", "status", "settings", "set", "reset", "devices"])
+    parser.add_argument("command", choices=["daemon", "toggle", "cancel", "status", "settings", "set", "reset", "devices", "overlay"])
     parser.add_argument("args", nargs="*", help="set: NAME VALUE; reset: NAME")
     args = parser.parse_args()
     if args.command == "daemon" and sys.stderr is None:
@@ -1092,7 +1204,14 @@ def main() -> int:
         except OSError:
             print(format_settings({"daemon": "not running (values as this shell would start it)"}))
         return 0
+    if args.command == "overlay":
+        if not IS_MAC or len(args.args) != 1:
+            parser.error("overlay is macOS-only and started by the daemon")
+        run_mac_overlay(int(args.args[0]))
+        return 0
     if args.command == "daemon":
+        if IS_MAC:
+            start_mac_overlay()
         try:
             VoiceToTextDaemon().serve()
         except KeyboardInterrupt:
