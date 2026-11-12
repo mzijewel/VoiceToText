@@ -1047,6 +1047,11 @@ class VoiceToTextDaemon:
         except Exception as exc:
             log.warning("Could not list input devices: %s", exc)
             devices = []
+        try:
+            ollama = ollama_models(timeout=1)
+        except Exception as exc:
+            log.debug("Could not list Ollama models: %s", exc)
+            ollama = None  # the page falls back to a text field
         settings = [
             {"name": name, "value": SETTINGS[name], "source": SETTING_SOURCES[name],
              "default": default, "choices": choices}
@@ -1059,6 +1064,7 @@ class VoiceToTextDaemon:
             "settings": settings,
             "super_key": "Cmd" if IS_MAC else "Win" if IS_WINDOWS else "Super",
             "devices": devices,
+            "ollama_models": ollama,
             "loaded_model": self.loaded_model(),
             "last_mic": self.input_device,
             "config_path": str(CONFIG_PATH),
@@ -1240,6 +1246,12 @@ def lock_exclusive(file) -> None:
             log.debug("Still waiting for startup lock")
 
 
+def ollama_models(timeout: float = 3) -> list[str]:
+    """Names of the models installed in Ollama (raises if Ollama can't be reached)."""
+    with urllib.request.urlopen(SETTINGS["ollama_url"].rstrip("/") + "/api/tags", timeout=timeout) as response:
+        return sorted(m["name"] for m in json.load(response).get("models", []))
+
+
 def ollama_chat(messages: list[dict[str, str]], timeout: float) -> str:
     body = {
         "model": SETTINGS["ollama_model"], "messages": messages, "stream": False,
@@ -1371,8 +1383,7 @@ def validate_setting(name: str, value: str | None) -> tuple[str | None, list[str
             raise ValueError(f"Invalid hotkey {value!r}: {exc}. Example: <ctrl>+<alt>+<space>") from None
     if name == "ollama_model":
         try:
-            with urllib.request.urlopen(SETTINGS["ollama_url"].rstrip("/") + "/api/tags", timeout=3) as response:
-                installed = [m["name"] for m in json.load(response).get("models", [])]
+            installed = ollama_models()
         except Exception as exc:
             warnings.append(f"Warning: could not list Ollama models ({exc}); saving anyway.")
         else:
@@ -1686,7 +1697,7 @@ const LABELS = {
   cleanup: ['Cleanup', 'Polish the transcript with an LLM before pasting'],
   ollama_model: ['Ollama model', 'Must already be installed in Ollama'],
   ollama_url: ['Ollama URL', ''],
-  claude_model: ['Claude model', 'haiku, sonnet, opus or a full model id'],
+  claude_model: ['Claude model', 'Latest of each; set a full model id with: vtt set claude_model <id>'],
   compute_type: ['Compute type', 'Takes effect on the next transcription'],
   log_level: ['Log level', ''],
 };
@@ -1695,7 +1706,11 @@ const GROUPS = [
   ['Transcript cleanup', ['cleanup', 'ollama_model', 'ollama_url', 'claude_model']],
   ['Advanced', ['compute_type', 'log_level']],
 ];
-const VALUE_NAMES = {language: {auto: 'Auto-detect', en: 'English', bn: 'Bangla'}};
+const VALUE_NAMES = {
+  language: {auto: 'Auto-detect', en: 'English', bn: 'Bangla'},
+  claude_model: {haiku: 'Haiku (fastest)', sonnet: 'Sonnet', opus: 'Opus (slowest)'},
+};
+const CLAUDE_MODELS = ['haiku', 'sonnet', 'opus'];
 
 let info = null;
 let historyVersion = -1;
@@ -1768,8 +1783,8 @@ function hotkeyControl(s, id) {
   return control;
 }
 
-function settingRow(s, devices) {
-  const [label, hint] = LABELS[s.name] || [s.name, ''];
+function settingRow(s, devices, ollamaModels) {
+  let [label, hint] = LABELS[s.name] || [s.name, ''];
   const id = 'set-' + s.name;
   let options = s.choices;
   const names = {...VALUE_NAMES[s.name]};
@@ -1777,6 +1792,16 @@ function settingRow(s, devices) {
     options = ['auto', ...devices.map((d) => d.name)];
     names.auto = 'Auto (system default)';
     for (const d of devices) names[d.name] = d.label;
+  }
+  if (s.name === 'claude_model') options = CLAUDE_MODELS;
+  if (s.name === 'ollama_model') {
+    if (ollamaModels && ollamaModels.length) {
+      options = ollamaModels;
+      if (!options.includes(s.value) && options.includes(s.value + ':latest')) s = {...s, value: s.value + ':latest'};
+      hint = 'Installed in Ollama (ollama pull <name> to add more)';
+    } else {
+      hint = ollamaModels ? 'No models installed in Ollama (ollama pull <name>)' : 'Ollama not reachable, type a model name';
+    }
   }
   let control;
   if (s.name === 'hotkey') {
@@ -1813,7 +1838,7 @@ function renderSettings() {
   const extra = info.settings.map((s) => s.name).filter((n) => !listed.has(n));
   for (const [title, names] of GROUPS) {
     const all = title === 'Advanced' ? [...names, ...extra] : names;
-    const rows = all.filter((n) => byName.has(n)).map((n) => settingRow(byName.get(n), info.devices));
+    const rows = all.filter((n) => byName.has(n)).map((n) => settingRow(byName.get(n), info.devices, info.ollama_models));
     if (rows.length) box.append(el('div', {className: 'group', textContent: title}), ...rows);
   }
   const foot = $('footer');
