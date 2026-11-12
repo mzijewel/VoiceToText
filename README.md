@@ -133,7 +133,12 @@ vtt toggle                 # start/stop recording
 vtt cancel                 # discard the current recording
 vtt status                 # recording | idle
 vtt devices                # list input devices (for `vtt set device`)
+vtt gui                    # open the web UI in your browser
 ```
+
+### Web UI
+
+`vtt gui` opens a local page (served by the daemon on `127.0.0.1`, started if needed) with a record/stop button and live mic level, every setting below as a form (saved and applied immediately, same as `vtt set`), and the last 50 transcripts with copy buttons. The address contains a random access token, so reopen the page with `vtt gui` after the daemon restarts. Recent transcripts are kept in `history.json` in the data directory; the page's **Clear** button deletes them.
 
 ### Changing settings
 

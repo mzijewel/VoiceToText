@@ -3,18 +3,22 @@
 from __future__ import annotations
 
 import argparse
+import hmac
+import http.server
 import json
 import logging
 import logging.handlers
 import os
 import platform
 import queue
+import secrets
 import shutil
 import socket
 import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -60,6 +64,8 @@ BLOCK_SECONDS = 0.05
 LEVEL_LOG_SECONDS = 1.0  # how often to log a mic level summary while recording
 PASTE_ACK_TIMEOUT = 1.0  # seconds to wait for the overlay to confirm it pressed Ctrl+V (it polls every 50 ms)
 CONFIG_PATH = CONFIG_DIR / "config.json"
+HISTORY_PATH = APP_DIR / "history.json"  # recent transcripts, shown by the web UI (`app.py gui`)
+HISTORY_LIMIT = 50
 # GNOME binds the shortcut itself; elsewhere the daemon listens for it (pynput key syntax).
 DEFAULT_HOTKEY = "off" if IS_LINUX else "<cmd>+<shift>+<space>" if IS_MAC else "<ctrl>+<alt>+<space>"
 NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if IS_WINDOWS else {}  # no console flash
@@ -481,6 +487,10 @@ class VoiceToTextDaemon:
         self.paste_id = 0
         self.paste_acked = threading.Event()
         self.hotkey: GlobalHotkey | None = None
+        self.state_payload: dict = {}  # what write_state last published; served to the web UI
+        self.gui_url: str | None = None  # set once the web UI server has been started
+        self.history = load_history()
+        self.history_version = 0  # bumped on every change so the web UI knows when to refetch
         self.write_state("idle")
 
     def setup_hotkey(self) -> None:
@@ -511,11 +521,10 @@ class VoiceToTextDaemon:
         if (state, message) != self.last_state:
             log.debug("State %s -> %s %r", self.last_state, state, message)
             self.last_state = (state, message)
+        self.state_payload = {"state": state, "level": round(level, 3), "message": message, "ts": time.time(), **extra}
         tmp = STATE_PATH.with_suffix(".tmp")
         try:
-            tmp.write_text(json.dumps(
-                {"state": state, "level": round(level, 3), "message": message, "ts": time.time(), **extra}
-            ))
+            tmp.write_text(json.dumps(self.state_payload))
             os.replace(tmp, STATE_PATH)
         except OSError as exc:
             log.error("Could not write state file %s: %s", STATE_PATH, exc)
@@ -716,6 +725,7 @@ class VoiceToTextDaemon:
                 notice = ("warning", f"Copied — auto-paste failed, press {'Cmd' if IS_MAC else 'Ctrl'}+V")
             total_seconds = time.perf_counter() - processing_start
             log.info("Transcription (%s): %s", info.language, text)
+            self.add_history(text, info.language, duration)
             log.info("Timing: audio %.1fs | model load %.2fs | transcribe %.2fs | cleanup %.2fs | "
                      "total after recording %.2fs",
                      duration, load_seconds, transcribe_seconds, cleanup_seconds, total_seconds)
@@ -763,6 +773,67 @@ class VoiceToTextDaemon:
             return False
         log.info("Pasted into focused app via wtype")
         return True
+
+    def add_history(self, text: str, language: str, audio_seconds: float) -> None:
+        with self.lock:
+            self.history.append({"ts": time.time(), "text": text, "language": language,
+                                 "audio_seconds": round(audio_seconds, 1)})
+            del self.history[:-HISTORY_LIMIT]
+            self.history_version += 1
+            save_history(self.history)
+
+    def clear_history(self) -> None:
+        with self.lock:
+            self.history.clear()
+            self.history_version += 1
+            save_history(self.history)
+
+    def loaded_model(self) -> str:
+        return f"{self.model_key[0]} ({self.model_key[1]})" if self.model_key else "not loaded yet"
+
+    def start_gui(self) -> str:
+        """Start the web UI server on first use; returns its URL (with the access token)."""
+        if self.gui_url is None:
+            token = secrets.token_urlsafe(16)
+            handler = type("BoundGuiHandler", (GuiHandler,), {"daemon": self, "token": token})
+            server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            threading.Thread(target=server.serve_forever, name="gui", daemon=True).start()
+            self.gui_url = f"http://127.0.0.1:{server.server_address[1]}/?token={token}"
+            log.info("Web UI listening on 127.0.0.1:%d", server.server_address[1])
+        return self.gui_url
+
+    def gui_status(self) -> dict:
+        """Small payload the web UI polls several times a second."""
+        return {**self.state_payload, "recording": self.recording, "history_version": self.history_version}
+
+    def gui_info(self) -> dict:
+        try:
+            devices = list(dict.fromkeys(d["name"] for d in sd.query_devices() if d["max_input_channels"] > 0))
+        except Exception as exc:
+            log.warning("Could not list input devices: %s", exc)
+            devices = []
+        return {
+            "settings": [
+                {"name": name, "value": SETTINGS[name], "source": SETTING_SOURCES[name],
+                 "default": default, "choices": choices}
+                for name, (_, default, choices) in SETTING_SPECS.items()
+            ],
+            "devices": devices,
+            "loaded_model": self.loaded_model(),
+            "last_mic": self.input_device,
+            "config_path": str(CONFIG_PATH),
+            "log_path": str(LOG_PATH),
+            "paste_key": "Cmd+V" if IS_MAC else "Ctrl+V",
+            "history": self.history[::-1],  # newest first
+            "history_version": self.history_version,
+        }
+
+    def gui_set(self, name: str, value: str | None) -> dict:
+        """Web UI counterpart of `app.py set`/`reset`."""
+        value, warnings = validate_setting(name, value)
+        save_setting(name, value)
+        log.info("Setting %s %s (web UI)", name, f"= {value!r}" if value is not None else "reset")
+        return {"message": " ".join([*warnings, self.reload_settings()])}
 
     def paste_done(self, paste_id: str) -> str:
         if paste_id == str(self.paste_id):
@@ -821,9 +892,10 @@ class VoiceToTextDaemon:
                     elif command == "status":
                         result = "recording" if self.recording else "idle"
                     elif command == "settings":
-                        loaded = f"{self.model_key[0]} ({self.model_key[1]})" if self.model_key else "not loaded yet"
-                        result = format_settings({"loaded model": loaded, "last mic": self.input_device,
+                        result = format_settings({"loaded model": self.loaded_model(), "last mic": self.input_device,
                                                   "daemon pid": str(os.getpid())})
+                    elif command == "gui":
+                        result = self.start_gui()
                     elif command == "reload":
                         result = self.reload_settings()
                     elif command.startswith("pasted "):
@@ -833,7 +905,7 @@ class VoiceToTextDaemon:
                         result = "unknown command"
                     # status is polled frequently (e.g. by clients waiting for startup), so keep it at DEBUG
                     log.log(logging.DEBUG if command == "status" else logging.INFO,
-                            "Command %r -> %r", command, result)
+                            "Command %r -> %r", command, "<web UI url>" if command == "gui" else result)
                     conn.sendall(result.encode())
                 except (BrokenPipeError, ConnectionResetError):
                     log.debug("Client hung up before the reply was sent")
@@ -1034,37 +1106,49 @@ def list_input_devices() -> str:
     return "\n".join(lines)
 
 
+def validate_setting(name: str, value: str | None) -> tuple[str | None, list[str]]:
+    """Check a new value (None = reset); returns (normalized value, warnings) or raises ValueError."""
+    warnings: list[str] = []
+    if name not in SETTING_SPECS:
+        raise ValueError(f"Unknown setting {name!r}; choose from: {', '.join(SETTING_SPECS)}")
+    if value is None:
+        return None, warnings
+    choices = SETTING_SPECS[name][2]
+    if name == "log_level":
+        value = value.upper()
+    if not value:
+        raise ValueError(f"{name} needs a value")
+    if choices and value not in choices:
+        raise ValueError(f"Invalid {name} {value!r}; choose from: {', '.join(choices)}")
+    if name == "hotkey":
+        try:
+            validate_hotkey(value)
+        except ImportError:
+            warnings.append("Warning: pynput is not installed (pip install pynput); saving anyway.")
+        except ValueError as exc:
+            raise ValueError(f"Invalid hotkey {value!r}: {exc}. Example: <ctrl>+<alt>+<space>") from None
+    if name == "ollama_model":
+        try:
+            with urllib.request.urlopen(SETTINGS["ollama_url"].rstrip("/") + "/api/tags", timeout=3) as response:
+                installed = [m["name"] for m in json.load(response).get("models", [])]
+        except Exception as exc:
+            warnings.append(f"Warning: could not list Ollama models ({exc}); saving anyway.")
+        else:
+            if value not in installed and f"{value}:latest" not in installed:
+                raise ValueError(f"Ollama model {value!r} is not installed; choose from: {', '.join(installed)}"
+                                 f"\n(or install it first: ollama pull {value})")
+    return value, warnings
+
+
 def change_setting(name: str, value: str | None) -> int:
     """`set`/`reset`: validate, persist, and tell a running daemon to reload."""
-    if name not in SETTING_SPECS:
-        print(f"Unknown setting {name!r}; choose from: {', '.join(SETTING_SPECS)}", file=sys.stderr)
+    try:
+        value, warnings = validate_setting(name, value)
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
         return 2
-    choices = SETTING_SPECS[name][2]
-    if value is not None:
-        if name == "log_level":
-            value = value.upper()
-        if choices and value not in choices:
-            print(f"Invalid {name} {value!r}; choose from: {', '.join(choices)}", file=sys.stderr)
-            return 2
-        if name == "hotkey":
-            try:
-                validate_hotkey(value)
-            except ImportError:
-                print("Warning: pynput is not installed (pip install pynput); saving anyway.", file=sys.stderr)
-            except ValueError as exc:
-                print(f"Invalid hotkey {value!r}: {exc}. Example: <ctrl>+<alt>+<space>", file=sys.stderr)
-                return 2
-        if name == "ollama_model":
-            try:
-                with urllib.request.urlopen(SETTINGS["ollama_url"].rstrip("/") + "/api/tags", timeout=3) as response:
-                    installed = [m["name"] for m in json.load(response).get("models", [])]
-            except Exception as exc:
-                print(f"Warning: could not list Ollama models ({exc}); saving anyway.", file=sys.stderr)
-            else:
-                if value not in installed and f"{value}:latest" not in installed:
-                    print(f"Ollama model {value!r} is not installed; choose from: {', '.join(installed)}"
-                          f"\n(or install it first: ollama pull {value})", file=sys.stderr)
-                    return 2
+    for warning in warnings:
+        print(warning, file=sys.stderr)
     save_setting(name, value)
     log.info("Setting %s %s", name, f"= {value!r}" if value is not None else "reset")
     print(f"{name} = {value}" if value is not None else f"{name} reset (env var or default applies)")
@@ -1073,6 +1157,461 @@ def change_setting(name: str, value: str | None) -> int:
     except OSError:
         print("Daemon not running; the setting applies when it starts.")
     return 0
+
+
+def load_history() -> list[dict]:
+    try:
+        data = json.loads(HISTORY_PATH.read_text(encoding="utf-8"))
+        return [e for e in data if isinstance(e, dict) and isinstance(e.get("text"), str)][-HISTORY_LIMIT:]
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError, TypeError) as exc:
+        log.warning("Ignoring unreadable history %s: %s", HISTORY_PATH, exc)
+        return []
+
+
+def save_history(entries: list[dict]) -> None:
+    try:
+        tmp = HISTORY_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(entries, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, HISTORY_PATH)
+    except OSError as exc:
+        log.error("Could not save history %s: %s", HISTORY_PATH, exc)
+
+
+class GuiHandler(http.server.BaseHTTPRequestHandler):
+    """Web UI (`app.py gui`): serves GUI_HTML plus a small JSON API, bound to 127.0.0.1 inside the daemon.
+
+    Every API call must carry the random token from the URL the daemon handed out, so other local
+    users and web pages (which can reach 127.0.0.1 but cannot know the token) are refused.
+    """
+
+    daemon: VoiceToTextDaemon  # both set on a subclass by start_gui
+    token: str
+
+    def log_message(self, format: str, *args) -> None:  # the default writes every request to stderr
+        pass
+
+    def reply(self, status: int, body: dict | str) -> None:
+        html = isinstance(body, str)
+        data = (body if html else json.dumps(body, ensure_ascii=False)).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8" if html else "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
+    def authorized(self) -> bool:
+        if hmac.compare_digest(self.headers.get("X-VTT-Token", "").encode(), self.token.encode()):
+            return True
+        self.reply(403, {"error": "Bad or missing token; open the page with `vtt gui`."})
+        return False
+
+    def do_GET(self) -> None:
+        path = urllib.parse.urlsplit(self.path).path
+        if path == "/":
+            self.reply(200, GUI_HTML)
+        elif not self.authorized():
+            pass
+        elif path == "/api/status":
+            self.reply(200, self.daemon.gui_status())
+        elif path == "/api/info":
+            self.reply(200, self.daemon.gui_info())
+        else:
+            self.reply(404, {"error": "not found"})
+
+    def do_POST(self) -> None:
+        if not self.authorized():
+            return
+        path = urllib.parse.urlsplit(self.path).path
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(length)) if 0 < length <= 65536 else {}
+            if path == "/api/toggle":
+                result = {"message": self.daemon.toggle()}
+            elif path == "/api/cancel":
+                result = {"message": self.daemon.cancel()}
+            elif path == "/api/set":
+                name, value = body.get("name"), body.get("value")
+                if not isinstance(name, str) or not (value is None or isinstance(value, str)):
+                    raise ValueError("expected {name: string, value: string or null}")
+                result = self.daemon.gui_set(name, value)
+            elif path == "/api/history/clear":
+                self.daemon.clear_history()
+                result = {"message": "History cleared."}
+            else:
+                self.reply(404, {"error": "not found"})
+                return
+            log.info("Web UI %s -> %r", path, result["message"])
+            self.reply(200, result)
+        except ValueError as exc:  # bad JSON or a rejected setting
+            self.reply(400, {"error": str(exc)})
+        except Exception as exc:
+            log.exception("Web UI request %s failed", path)
+            self.reply(500, {"error": f"{type(exc).__name__}: {exc}"})
+
+
+GUI_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voice to Text</title>
+<style>
+:root {
+  --bg: #f5f4f0; --card: #ffffff; --line: #e3e1da; --text: #1d1c1a; --muted: #6d6a63;
+  --accent: #2c6e5c; --accent-text: #ffffff; --rec: #d2433b; --warn: #a8690a; --field: #faf9f6;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #161614; --card: #1f1e1c; --line: #33312d; --text: #eceae5; --muted: #a09c93;
+    --accent: #5fb39c; --accent-text: #10201b; --rec: #ef6a61; --warn: #e0a548; --field: #262522;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", "Noto Sans", "Noto Sans Bengali", sans-serif; }
+main { max-width: 760px; margin: 0 auto; padding: 28px 16px 48px; }
+header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 20px; }
+h1 { font-size: 20px; margin: 0; letter-spacing: -0.01em; }
+h2 { font-size: 13px; margin: 0; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); font-weight: 600; }
+.pill { display: inline-flex; align-items: center; gap: 7px; padding: 4px 11px; border-radius: 999px;
+  border: 1px solid var(--line); background: var(--card); font-size: 13px; color: var(--muted); white-space: nowrap; }
+.pill i { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+.pill.ok i { background: var(--accent); }
+.pill.rec { color: var(--rec); } .pill.rec i { background: var(--rec); animation: blink 1s infinite; }
+.pill.busy i { background: var(--warn); animation: blink 1s infinite; }
+.pill.off i { background: var(--rec); }
+@keyframes blink { 50% { opacity: 0.3; } }
+section { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 18px; margin-bottom: 16px; }
+.sechead { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+button { font: inherit; color: var(--text); background: var(--field); border: 1px solid var(--line);
+  border-radius: 8px; padding: 6px 12px; cursor: pointer; }
+button:hover:not(:disabled) { border-color: var(--muted); }
+button:disabled { opacity: 0.5; cursor: default; }
+button.small { font-size: 12.5px; padding: 3px 9px; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.recorder { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+#record { min-width: 132px; padding: 11px 18px; border-radius: 999px; border: none; font-weight: 600;
+  background: var(--accent); color: var(--accent-text); }
+#record.rec { background: var(--rec); color: #fff; }
+.live { flex: 1; min-width: 180px; }
+#message { font-size: 14px; color: var(--muted); min-height: 21px; }
+#message.warning { color: var(--warn); } #message.error { color: var(--rec); }
+.meter { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; margin-top: 6px; }
+.meter b { display: block; height: 100%; width: 0; background: var(--rec); transition: width 90ms linear; }
+#scratch { width: 100%; margin-top: 14px; min-height: 68px; resize: vertical; font: inherit; color: var(--text);
+  background: var(--field); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+.group { font-size: 12.5px; color: var(--muted); font-weight: 600; margin: 16px 0 2px; }
+.group:first-of-type { margin-top: 0; }
+.row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 250px); gap: 6px 16px; align-items: center;
+  padding: 10px 0; border-top: 1px solid var(--line); }
+.row label { font-weight: 550; }
+.hint { font-size: 12.5px; color: var(--muted); }
+.ctl { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.ctl select, .ctl input { width: 100%; font: inherit; color: var(--text); background: var(--field);
+  border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; min-width: 0; }
+.src { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--muted); }
+.entry { border-top: 1px solid var(--line); padding: 10px 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 12px; }
+.entry .meta { font-size: 12px; color: var(--muted); grid-column: 1 / -1; }
+.entry .text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.empty { color: var(--muted); font-size: 14px; }
+footer { font-size: 12px; color: var(--muted); padding: 0 4px; overflow-wrap: anywhere; }
+footer div { margin-top: 2px; }
+code { font: 12.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+#toast { position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%); max-width: calc(100vw - 32px);
+  background: var(--text); color: var(--bg); padding: 8px 14px; border-radius: 10px; font-size: 13.5px;
+  white-space: pre-wrap; opacity: 0; pointer-events: none; transition: opacity 0.2s; }
+#toast.show { opacity: 1; } #toast.bad { background: var(--rec); color: #fff; }
+@media (max-width: 560px) { .row { grid-template-columns: minmax(0, 1fr); } }
+@media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Voice to Text</h1>
+    <span id="pill" class="pill" role="status"><i></i><span id="pilltext">Connecting…</span></span>
+  </header>
+
+  <section aria-label="Recorder">
+    <div class="recorder">
+      <button id="record" disabled>Record</button>
+      <button id="cancel" hidden>Cancel</button>
+      <div class="live">
+        <div id="message"></div>
+        <div class="meter" aria-hidden="true"><b id="level"></b></div>
+      </div>
+    </div>
+    <textarea id="scratch" aria-label="Scratch pad"
+      placeholder="Scratch pad: recordings started with the button above are pasted here."></textarea>
+  </section>
+
+  <section aria-label="Settings">
+    <div class="sechead"><h2>Settings</h2><span class="hint">Changes are saved and applied immediately</span></div>
+    <div id="settings"><div class="empty">Loading…</div></div>
+  </section>
+
+  <section aria-label="History">
+    <div class="sechead"><h2>Recent transcripts</h2><button id="clear" class="small" hidden>Clear</button></div>
+    <div id="history"><div class="empty">Loading…</div></div>
+  </section>
+
+  <footer id="footer"></footer>
+</main>
+<div id="toast" role="status"></div>
+<script>
+'use strict';
+const $ = (id) => document.getElementById(id);
+function el(tag, props, ...children) {
+  const node = Object.assign(document.createElement(tag), props || {});
+  node.append(...children);
+  return node;
+}
+
+// The daemon hands out the URL with a token; keep it for reloads and take it out of the address bar.
+let token = new URLSearchParams(location.search).get('token');
+try {
+  if (token) {
+    sessionStorage.setItem('vtt-token', token);
+    window.history.replaceState(null, '', location.pathname);
+  } else {
+    token = sessionStorage.getItem('vtt-token');
+  }
+} catch (e) { /* storage blocked: the token still works until the page is reloaded */ }
+
+async function api(path, body) {
+  const options = {headers: {'X-VTT-Token': token || ''}};
+  if (body !== undefined) {
+    options.method = 'POST';
+    options.headers['Content-Type'] = 'application/json';
+    options.body = JSON.stringify(body);
+  }
+  const response = await fetch(path, options);
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(data.error || ('HTTP ' + response.status));
+    error.status = response.status;
+    throw error;
+  }
+  return data;
+}
+
+let toastTimer;
+function toast(text, bad) {
+  const t = $('toast');
+  t.textContent = text;
+  t.className = 'show' + (bad ? ' bad' : '');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.className = ''; }, bad ? 6000 : 2500);
+}
+
+const LABELS = {
+  language: ['Language', 'Auto-detect picks Bangla or English for each recording'],
+  model: ['Whisper model', 'Larger models are more accurate but slower; loaded on the next transcription'],
+  device: ['Microphone', 'Auto uses the system default input'],
+  hotkey: ['Global hotkey', 'For example <ctrl>+<alt>+<space>, or off'],
+  sounds: ['Sound cues', 'Beep on start, stop and problems'],
+  cleanup: ['Cleanup', 'Polish the transcript with an LLM before pasting'],
+  ollama_model: ['Ollama model', 'Must already be installed in Ollama'],
+  ollama_url: ['Ollama URL', ''],
+  claude_model: ['Claude model', 'haiku, sonnet, opus or a full model id'],
+  compute_type: ['Compute type', 'Takes effect on the next transcription'],
+  log_level: ['Log level', ''],
+};
+const GROUPS = [
+  ['General', ['language', 'model', 'device', 'hotkey', 'sounds']],
+  ['Transcript cleanup', ['cleanup', 'ollama_model', 'ollama_url', 'claude_model']],
+  ['Advanced', ['compute_type', 'log_level']],
+];
+const VALUE_NAMES = {language: {auto: 'Auto-detect', en: 'English', bn: 'Bangla'}};
+
+let info = null;
+let historyVersion = -1;
+let pasteKey = 'Ctrl+V';
+
+async function saveSetting(name, value) {
+  try {
+    const result = await api('/api/set', {name, value});
+    toast(result.message || 'Saved');
+  } catch (e) {
+    toast(e.message, true);
+  }
+  await loadInfo(true);
+}
+
+function settingRow(s, devices) {
+  const [label, hint] = LABELS[s.name] || [s.name, ''];
+  const id = 'set-' + s.name;
+  let options = s.choices;
+  if (s.name === 'device') options = ['auto', ...devices];
+  let control;
+  if (options) {
+    if (!options.includes(s.value)) options = [...options, s.value];
+    control = el('select', {id});
+    const names = VALUE_NAMES[s.name] || {};
+    for (const o of options) control.append(el('option', {value: o, textContent: names[o] || o}));
+    control.value = s.value;
+  } else {
+    control = el('input', {id, type: 'text', value: s.value, spellcheck: false, autocomplete: 'off'});
+  }
+  control.addEventListener('change', () => {
+    const value = control.value.trim();
+    if (value !== s.value) saveSetting(s.name, value);
+  });
+  const saved = s.source === 'config file';
+  const src = el('div', {className: 'src'}, el('span', {textContent: saved ? 'Saved' : s.source === 'default' ? 'Default' : 'From ' + s.source}));
+  if (saved) {
+    const reset = el('button', {className: 'small', textContent: 'Reset', title: 'Drop the saved value'});
+    reset.addEventListener('click', () => saveSetting(s.name, null));
+    src.append(reset);
+  }
+  const left = el('div', null, el('label', {htmlFor: id, textContent: label}));
+  if (hint) left.append(el('div', {className: 'hint', textContent: hint}));
+  return el('div', {className: 'row'}, left, el('div', {className: 'ctl'}, control, src));
+}
+
+function renderSettings() {
+  const byName = new Map(info.settings.map((s) => [s.name, s]));
+  const box = $('settings');
+  box.replaceChildren();
+  const listed = new Set(GROUPS.flatMap((g) => g[1]));
+  const extra = info.settings.map((s) => s.name).filter((n) => !listed.has(n));
+  for (const [title, names] of GROUPS) {
+    const all = title === 'Advanced' ? [...names, ...extra] : names;
+    const rows = all.filter((n) => byName.has(n)).map((n) => settingRow(byName.get(n), info.devices));
+    if (rows.length) box.append(el('div', {className: 'group', textContent: title}), ...rows);
+  }
+  const foot = $('footer');
+  foot.replaceChildren(
+    el('div', {textContent: 'Loaded model: ' + info.loaded_model + ' · Last microphone: ' + info.last_mic}),
+    el('div', null, 'Settings file: ', el('code', {textContent: info.config_path})),
+    el('div', null, 'Log: ', el('code', {textContent: info.log_path})),
+  );
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (e) {
+    const area = el('textarea', {value: text});
+    document.body.append(area);
+    area.select();
+    document.execCommand('copy');
+    area.remove();
+  }
+  toast('Copied');
+}
+
+function renderHistory() {
+  const box = $('history');
+  box.replaceChildren();
+  $('clear').hidden = !info.history.length;
+  if (!info.history.length) {
+    box.append(el('div', {className: 'empty', textContent: 'Nothing yet. Transcripts appear here after each recording.'}));
+    return;
+  }
+  for (const entry of info.history) {
+    const when = new Date(entry.ts * 1000).toLocaleString([], {dateStyle: 'medium', timeStyle: 'short'});
+    const meta = [when, entry.language, entry.audio_seconds != null ? entry.audio_seconds + ' s' : null];
+    const copy = el('button', {className: 'small', textContent: 'Copy'});
+    copy.addEventListener('click', () => copyText(entry.text));
+    box.append(el('div', {className: 'entry'},
+      el('div', {className: 'meta', textContent: meta.filter(Boolean).join(' · ')}),
+      el('div', {className: 'text', textContent: entry.text}),
+      el('div', null, copy)));
+  }
+}
+
+async function loadInfo(withSettings) {
+  info = await api('/api/info');
+  historyVersion = info.history_version;
+  pasteKey = info.paste_key;
+  if (withSettings) renderSettings();
+  renderHistory();
+}
+
+let recordingSince = 0;
+function renderStatus(st) {
+  const record = $('record'), message = $('message'), pill = $('pill');
+  const busy = st.state === 'processing' || st.state === 'pasting';
+  const recording = st.state === 'recording';
+  if (recording && !recordingSince) recordingSince = Date.now();
+  if (!recording) recordingSince = 0;
+  record.disabled = busy;
+  record.textContent = recording ? 'Stop' : 'Record';
+  record.className = recording ? 'rec' : '';
+  $('cancel').hidden = !recording;
+  $('level').style.width = (recording ? Math.round(Math.min(1, st.level || 0) * 100) : 0) + '%';
+  message.className = '';
+  if (recording) {
+    const seconds = Math.floor((Date.now() - recordingSince) / 1000);
+    message.textContent = 'Listening… ' + Math.floor(seconds / 60) + ':' + String(seconds % 60).padStart(2, '0');
+    pill.className = 'pill rec'; $('pilltext').textContent = 'Recording';
+  } else if (busy) {
+    message.textContent = st.message || 'Working…';
+    pill.className = 'pill busy'; $('pilltext').textContent = 'Processing';
+  } else {
+    const recent = Date.now() / 1000 - (st.ts || 0) < 8;
+    if ((st.state === 'error' || st.state === 'warning') && recent) {
+      message.textContent = st.message;
+      message.className = st.state;
+    } else {
+      message.textContent = 'Press Record or your shortcut, speak, then stop.';
+    }
+    pill.className = 'pill ok'; $('pilltext').textContent = 'Ready';
+  }
+}
+
+function disconnected(error) {
+  $('record').disabled = true;
+  $('cancel').hidden = true;
+  $('level').style.width = '0%';
+  $('pill').className = 'pill off';
+  $('pilltext').textContent = 'Disconnected';
+  $('message').className = 'error';
+  $('message').textContent = error.status === 403
+    ? 'This page has no valid access token. Run "vtt gui" to open it again.'
+    : 'The daemon is not running. Run "vtt gui" to start it and reopen this page.';
+}
+
+async function poll() {
+  let delay = 600;
+  try {
+    const st = await api('/api/status');
+    renderStatus(st);
+    if (!info) await loadInfo(true);
+    else if (st.history_version !== historyVersion) await loadInfo(false);
+    if (st.state !== 'idle' && st.state !== 'error' && st.state !== 'warning') delay = 100;
+  } catch (e) {
+    disconnected(e);
+    delay = 1500;
+  }
+  setTimeout(poll, delay);
+}
+
+$('record').addEventListener('click', async () => {
+  $('scratch').focus();  // the daemon pastes into whatever has focus
+  try { await api('/api/toggle', {}); } catch (e) { toast(e.message, true); }
+});
+$('cancel').addEventListener('click', async () => {
+  try { await api('/api/cancel', {}); } catch (e) { toast(e.message, true); }
+});
+$('clear').addEventListener('click', async () => {
+  if (!confirm('Delete all saved transcripts?')) return;
+  try { await api('/api/history/clear', {}); await loadInfo(false); } catch (e) { toast(e.message, true); }
+});
+// Pick up settings changed elsewhere (vtt set …) when coming back to the tab, unless a field is being edited.
+window.addEventListener('focus', () => {
+  const editing = document.activeElement && document.activeElement.closest('#settings');
+  if (info && !editing) loadInfo(true).catch(() => {});
+});
+poll();
+</script>
+</body>
+</html>
+"""
 
 
 def run_mac_overlay(parent_pid: int) -> None:
@@ -1189,9 +1728,9 @@ def start_mac_overlay() -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Local voice-to-text (Linux/Wayland, macOS, Windows)",
-        epilog="examples: app.py settings | app.py set language bn | app.py reset language | app.py devices",
+        epilog="examples: app.py gui | app.py settings | app.py set language bn | app.py reset language | app.py devices",
     )
-    parser.add_argument("command", choices=["daemon", "toggle", "cancel", "status", "settings", "set", "reset", "devices", "overlay"])
+    parser.add_argument("command", choices=["daemon", "toggle", "cancel", "status", "settings", "set", "reset", "devices", "gui", "overlay"])
     parser.add_argument("args", nargs="*", help="set: NAME VALUE; reset: NAME")
     args = parser.parse_args()
     if args.command == "daemon" and sys.stderr is None:
@@ -1237,11 +1776,21 @@ def main() -> int:
         try:
             response = send_command(args.command)
         except OSError as exc:
-            if args.command != "toggle":
+            if args.command not in ("toggle", "gui"):
                 raise
             log.info("Daemon not reachable (%s); starting it", exc)
             start_daemon()
             response = send_command(args.command)
+        if args.command == "gui":  # the response is the web UI's URL, including its access token
+            if not response.startswith("http://127.0.0.1:"):
+                print("The running daemon is an older version without the web UI; restart it.", file=sys.stderr)
+                return 1
+            log.info("Opening the web UI")
+            import webbrowser
+            if not webbrowser.open(response):
+                print("Could not open a browser; open this address yourself:")
+            print(response)
+            return 0
         log.log(logging.DEBUG if args.command == "status" else logging.INFO,
                 "Sent %r -> %r", args.command, response)
         print(response)

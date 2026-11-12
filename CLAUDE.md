@@ -22,6 +22,7 @@ python3 -m venv .venv && .venv/bin/pip install faster-whisper sounddevice numpy
 .venv/bin/python app.py set language bn   # persist to ~/.config/voice-to-text/config.json and live-reload the daemon
 .venv/bin/python app.py reset language    # drop a saved value (env var / default applies again)
 .venv/bin/python app.py devices           # list input devices for `set device`
+.venv/bin/python app.py gui               # open the web UI (settings, record button, transcript history) in the browser
 
 ./install.sh [--key K] [--model M] [--language L] [--no-apt|--no-service|--no-overlay]
                                           # full install: apt deps, ~/.local/share copy + venv, service, shortcut, overlay
@@ -40,11 +41,13 @@ System deps: `portaudio19-dev`, `wl-clipboard`, `wtype` (see README.md).
 
 Everything in Python lives in `app.py`; one process runs as the daemon, every other invocation is a thin client.
 
-- **Daemon (`app.py daemon`)** — `VoiceToTextDaemon` listens on a Unix socket at `$XDG_RUNTIME_DIR/voice-to-text.sock`. Plain-text commands: `toggle`, `cancel`, `status`, `settings`, `reload`. `toggle` spawns a worker thread (`record_and_transcribe`) that reads 50 ms blocks from `sounddevice` until `stop_event` is set, then saves a WAV under `~/.local/share/voice-to-text/`, transcribes (Whisper model is lazy-loaded on first use and cached), copies, and pastes. Recording only stops on a second `toggle` (no silence auto-stop).
+- **Daemon (`app.py daemon`)** — `VoiceToTextDaemon` listens on a Unix socket at `$XDG_RUNTIME_DIR/voice-to-text.sock`. Plain-text commands: `toggle`, `cancel`, `status`, `settings`, `reload`, `gui`. `toggle` spawns a worker thread (`record_and_transcribe`) that reads 50 ms blocks from `sounddevice` until `stop_event` is set, then saves a WAV under `~/.local/share/voice-to-text/`, transcribes (Whisper model is lazy-loaded on first use and cached), copies, and pastes. Recording only stops on a second `toggle` (no silence auto-stop).
 - **Client (`app.py toggle|cancel|status`)** — `send_command` connects to the socket. If `toggle` can't connect, `start_daemon` spawns a detached daemon (logging to `~/.local/share/voice-to-text/daemon.log`) guarded by an `flock` on `voice-to-text.lock` so rapid key presses don't start duplicates, then waits for the socket.
 - **Overlay (`gnome-extension/`)** — GNOME Shell extension (UUID `voice-to-text-overlay@local`, ESM, shell 46–50). It does **not** use the socket to learn state; it polls `$XDG_RUNTIME_DIR/voice-to-text.state` every 50 ms. The daemon writes that file atomically (`write_state`) as JSON `{state: idle|recording|processing|error|warning, level, message, ts}` ~20×/s while recording. `processing` carries the current step in `message` ("Loading small model…", "Transcribing… 40%", "Pasting…"), shown as a shimmering label; when the worker ends with a problem it writes `error`/`warning` with a message instead of `idle`, which the overlay shows for 4 s (click to dismiss). The overlay treats a `recording` state older than 1.5 s as stale (daemon died). Its X / ✓ buttons send `cancel` / `toggle` back over the socket. To paste, the daemon writes state `pasting` with an `id`; the overlay presses Ctrl+V (Ctrl+Shift+V when the focused window's WM_CLASS is in `TERMINAL_CLASSES`, e.g. Warp) through a Clutter virtual keyboard (Mutter lacks the virtual-keyboard protocol `wtype` needs) and replies `pasted <id>`. Without that ack within `PASTE_ACK_TIMEOUT` (1 s) the daemon falls back to `wtype`.
 
 When changing the state file format, socket path, or command names, update both `app.py` and `gnome-extension/extension.js`.
+
+- **Web UI (`app.py gui`)** — the `gui` socket command makes the daemon start (once, lazily) a `ThreadingHTTPServer` on `127.0.0.1:<ephemeral>` and return `http://127.0.0.1:<port>/?token=<random>`; the client auto-spawns the daemon like `toggle` and opens that URL with `webbrowser`. `GuiHandler` serves the single page embedded as `GUI_HTML` (installers copy only `app.py`, so there is no separate HTML file) and a JSON API that requires the token in an `X-VTT-Token` header: `GET /api/status` (last `write_state` payload, polled), `GET /api/info` (settings, devices, history), `POST /api/toggle|cancel|set|history/clear`. `set` goes through `validate_setting` (shared with the CLI's `change_setting`). The daemon keeps the last `HISTORY_LIMIT` transcripts in `history.json` under the data dir.
 
 ## Cross-platform
 

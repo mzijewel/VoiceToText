@@ -73,7 +73,7 @@ step "Removing app from $INSTALL_DIR"
 if [[ -d "$INSTALL_DIR" ]]; then
     rm -rf "$INSTALL_DIR/venv" "$INSTALL_DIR/app.py" "$INSTALL_DIR/daemon.log" "$INSTALL_DIR"/voice-to-text.log*
     if (( PURGE )); then
-        rm -f "$INSTALL_DIR"/recording-*.wav
+        rm -f "$INSTALL_DIR"/recording-*.wav "$INSTALL_DIR"/history.json
     fi
     rmdir "$INSTALL_DIR" 2>/dev/null || echo "Kept recordings in $INSTALL_DIR (use --purge to delete)."
 fi
