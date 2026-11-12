@@ -1,5 +1,5 @@
-// On-screen pill for the voice-to-text daemon: cancel (X), live level bars, confirm (check) while
-// recording; a shimmering status label ("Loading model…", "Transcribing… 40%") while processing;
+// On-screen pill for the voice-to-text daemon: cancel (X), live level bars, elapsed time, confirm (check)
+// while recording; a shimmering status label ("Loading model…", "Transcribing… 40%") while processing;
 // and a short-lived error/warning message when something goes wrong (click the pill to dismiss).
 // It polls the daemon's state file and talks back over the daemon's unix socket. It also presses Ctrl+V
 // (Ctrl+Shift+V in terminals) for the daemon (state "pasting"), since Mutter offers no virtual-keyboard
@@ -98,6 +98,12 @@ export default class VoiceToTextOverlay extends Extension {
             this._barBox.add_child(bar);
         }
 
+        // Elapsed recording time; fixed width so the pill does not jitter as the digits change.
+        this._timeLabel = new St.Label({
+            y_align: Clutter.ActorAlign.CENTER,
+            style: 'font-size: 10.5pt; color: rgba(255,255,255,0.85); min-width: 34px; text-align: right; font-feature-settings: "tnum";',
+        });
+
         this._confirmButton = new St.Button({
             style: 'background-color: white; border-radius: 999px; width: 26px; height: 26px;',
             child: new St.Icon({icon_name: 'object-select-symbolic', icon_size: 14, style: 'color: black;'}),
@@ -128,6 +134,7 @@ export default class VoiceToTextOverlay extends Extension {
 
         this._pill.add_child(this._cancelButton);
         this._pill.add_child(this._barBox);
+        this._pill.add_child(this._timeLabel);
         this._pill.add_child(this._noticeIcon);
         this._pill.add_child(this._labelBox);
         this._pill.add_child(this._confirmButton);
@@ -164,7 +171,7 @@ export default class VoiceToTextOverlay extends Extension {
     }
 
     _poll() {
-        const {state, level, message, ts, id} = this._readState();
+        const {state, level, message, ts, id, elapsed} = this._readState();
         this._tick++;
 
         if (state === 'pasting' && id !== this._pastedId) {
@@ -188,6 +195,9 @@ export default class VoiceToTextOverlay extends Extension {
             this._shownKey = key;
             this._cancelButton.visible = recording;
             this._barBox.visible = recording;
+            this._timeLabel.visible = recording;
+            if (recording)
+                this._recordingSince = GLib.get_monotonic_time();
             this._confirmButton.visible = recording;
             this._labelBox.visible = !recording;
             this._shimmer.visible = !recording && !notice;
@@ -203,6 +213,11 @@ export default class VoiceToTextOverlay extends Extension {
         }
 
         if (recording) {
+            // The daemon reports the recorded time; fall back to our own clock for an older daemon.
+            const seconds = Math.floor(elapsed ?? (GLib.get_monotonic_time() - this._recordingSince) / 1e6);
+            const time = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+            if (this._timeLabel.text !== time)
+                this._timeLabel.text = time;
             this._levels.shift();
             this._levels.push(level ?? 0);
             for (let i = 0; i < BAR_COUNT; i++) {

@@ -11,6 +11,7 @@ import logging.handlers
 import os
 import platform
 import queue
+import re
 import secrets
 import shutil
 import socket
@@ -66,6 +67,7 @@ PASTE_ACK_TIMEOUT = 1.0  # seconds to wait for the overlay to confirm it pressed
 CONFIG_PATH = CONFIG_DIR / "config.json"
 HISTORY_PATH = APP_DIR / "history.json"  # recent transcripts, shown by the web UI (`app.py gui`)
 HISTORY_LIMIT = 50
+RECORDING_RE = re.compile(r"recording-(\d+)\.wav")  # WAVs saved by the worker in APP_DIR; played back by the web UI
 # GNOME binds the shortcut itself; elsewhere the daemon listens for it (pynput key syntax).
 DEFAULT_HOTKEY = "off" if IS_LINUX else "<cmd>+<shift>+<space>" if IS_MAC else "<ctrl>+<alt>+<space>"
 NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if IS_WINDOWS else {}  # no console flash
@@ -515,7 +517,8 @@ class VoiceToTextDaemon:
     def write_state(self, state: str, level: float = 0.0, message: str = "", **extra) -> None:
         """Publish state for the on-screen overlay (atomic replace so readers never see partial JSON).
 
-        States: idle, recording, processing (message = current step), error/warning (message shown briefly),
+        States: idle, recording (extra elapsed: seconds recorded so far, shown as a timer next to the level
+        bars), processing (message = current step), error/warning (message shown briefly),
         pasting (extra id: the overlay presses Ctrl+V and replies "pasted <id>" over the socket).
         """
         if (state, message) != self.last_state:
@@ -616,7 +619,8 @@ class VoiceToTextDaemon:
                     rms = float(np.sqrt(np.mean(np.square(mono)) + 1e-12))
                     window_rms.append(rms)
                     window_peak = max(window_peak, float(np.max(np.abs(mono))))
-                    self.write_state("recording", min(1.0, (rms ** 0.5) * 2.5))
+                    self.write_state("recording", min(1.0, (rms ** 0.5) * 2.5),
+                                     elapsed=round(len(chunks) * BLOCK_SECONDS, 1))
                     if time.monotonic() >= next_level_log:
                         log.debug("Recording %.1fs: rms avg=%.4f max=%.4f peak=%.4f",
                                   len(chunks) * BLOCK_SECONDS, sum(window_rms) / len(window_rms),
@@ -663,6 +667,8 @@ class VoiceToTextDaemon:
                 wf.setframerate(SAMPLE_RATE)
                 wf.writeframes(pcm16.tobytes())
             log.info("Saved %s (%d bytes)", wav_path, wav_path.stat().st_size)
+            with self.lock:
+                self.history_version += 1  # the web UI lists the recording even if no transcript follows
 
             self.write_state("processing", message="Preparing…")
             # notify("Transcribing locally…")
@@ -702,11 +708,13 @@ class VoiceToTextDaemon:
                 return
 
             cleanup_seconds = 0.0
+            polished_by = None  # cleanup provider that actually produced the text (shown in the web UI)
             if SETTINGS["cleanup"] != "off":
                 self.write_state("processing", message="Polishing…")
                 cleanup_start = time.perf_counter()
                 try:
                     text, used = cleanup_text(text)
+                    polished_by = used
                     if used != SETTINGS["cleanup"]:
                         notice = ("warning", "Claude unavailable — used local model")
                 except Exception as exc:
@@ -725,7 +733,7 @@ class VoiceToTextDaemon:
                 notice = ("warning", f"Copied — auto-paste failed, press {'Cmd' if IS_MAC else 'Ctrl'}+V")
             total_seconds = time.perf_counter() - processing_start
             log.info("Transcription (%s): %s", info.language, text)
-            self.add_history(text, info.language, duration)
+            self.add_history(text, info.language, duration, wav_path.name, polished_by)
             log.info("Timing: audio %.1fs | model load %.2fs | transcribe %.2fs | cleanup %.2fs | "
                      "total after recording %.2fs",
                      duration, load_seconds, transcribe_seconds, cleanup_seconds, total_seconds)
@@ -774,19 +782,81 @@ class VoiceToTextDaemon:
         log.info("Pasted into focused app via wtype")
         return True
 
-    def add_history(self, text: str, language: str, audio_seconds: float) -> None:
+    def add_history(self, text: str, language: str, audio_seconds: float, wav: str,
+                    polished_by: str | None = None) -> None:
         with self.lock:
             self.history.append({"ts": time.time(), "text": text, "language": language,
-                                 "audio_seconds": round(audio_seconds, 1)})
+                                 "audio_seconds": round(audio_seconds, 1), "wav": wav,
+                                 **({"polished_by": polished_by} if polished_by else {})})
             del self.history[:-HISTORY_LIMIT]
             self.history_version += 1
             save_history(self.history)
 
-    def clear_history(self) -> None:
+    def delete_entry(self, ts: float | None, wav: str | None) -> str:
+        """Delete one web UI row: its recording file (if any) and its transcript (if any, matched by `ts`)."""
+        if wav is not None:
+            if not RECORDING_RE.fullmatch(wav):  # also keeps the path inside APP_DIR
+                raise ValueError("bad recording name")
+            try:
+                (APP_DIR / wav).unlink()
+            except FileNotFoundError:
+                pass
+        with self.lock:
+            kept = [e for e in self.history if not (ts is not None and e.get("ts") == ts)]
+            removed = len(kept) != len(self.history)
+            self.history[:] = kept
+            self.history_version += 1
+            if removed:
+                save_history(self.history)
+        return "Deleted " + " and ".join(filter(None, [removed and "transcript", wav and "recording"])) + "." \
+            if removed or wav else "Nothing to delete."
+
+    def clear_history(self) -> int:
+        """Drop all transcripts and delete the saved recording files; returns how many files were deleted."""
+        deleted = 0
+        try:
+            for path in APP_DIR.glob("recording-*.wav"):
+                if RECORDING_RE.fullmatch(path.name):
+                    try:
+                        path.unlink()
+                        deleted += 1
+                    except OSError as exc:
+                        log.warning("Could not delete %s: %s", path, exc)
+        except OSError as exc:
+            log.warning("Could not list recordings in %s: %s", APP_DIR, exc)
         with self.lock:
             self.history.clear()
             self.history_version += 1
             save_history(self.history)
+        return deleted
+
+    def gui_history(self) -> list[dict]:
+        """Transcripts plus recording files for the web UI, newest first.
+
+        A transcript carries its recording as `wav` while that file still exists; recordings without a
+        transcript (nothing recognized, made before history existed, history cleared) are listed with
+        `text: None`.
+        """
+        recordings: dict[str, Path] = {}
+        try:
+            recordings = {p.name: p for p in APP_DIR.glob("recording-*.wav") if RECORDING_RE.fullmatch(p.name)}
+        except OSError as exc:
+            log.warning("Could not list recordings in %s: %s", APP_DIR, exc)
+        entries = []
+        for entry in list(self.history):
+            entry = dict(entry)
+            if recordings.pop(entry.get("wav"), None) is None:
+                entry.pop("wav", None)
+            entries.append(entry)
+        for name, path in recordings.items():
+            try:
+                seconds = max(0, path.stat().st_size - 44) / (2 * SAMPLE_RATE)  # 16-bit mono PCM
+            except OSError:
+                continue
+            entries.append({"ts": int(RECORDING_RE.fullmatch(name)[1]), "text": None, "wav": name,
+                            "audio_seconds": round(seconds, 1)})
+        entries.sort(key=lambda e: e.get("ts", 0), reverse=True)
+        return entries[:HISTORY_LIMIT]
 
     def loaded_model(self) -> str:
         return f"{self.model_key[0]} ({self.model_key[1]})" if self.model_key else "not loaded yet"
@@ -824,7 +894,7 @@ class VoiceToTextDaemon:
             "config_path": str(CONFIG_PATH),
             "log_path": str(LOG_PATH),
             "paste_key": "Cmd+V" if IS_MAC else "Ctrl+V",
-            "history": self.history[::-1],  # newest first
+            "history": self.gui_history(),
             "history_version": self.history_version,
         }
 
@@ -1218,8 +1288,26 @@ class GuiHandler(http.server.BaseHTTPRequestHandler):
             self.reply(200, self.daemon.gui_status())
         elif path == "/api/info":
             self.reply(200, self.daemon.gui_info())
+        elif path.startswith("/api/recording/"):
+            self.send_recording(path.rsplit("/", 1)[1])
         else:
             self.reply(404, {"error": "not found"})
+
+    def send_recording(self, name: str) -> None:
+        if not RECORDING_RE.fullmatch(name):  # also keeps the request inside APP_DIR
+            self.reply(404, {"error": "not found"})
+            return
+        try:
+            data = (APP_DIR / name).read_bytes()
+        except OSError:
+            self.reply(404, {"error": "recording not found"})
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "audio/wav")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
 
     def do_POST(self) -> None:
         if not self.authorized():
@@ -1237,9 +1325,14 @@ class GuiHandler(http.server.BaseHTTPRequestHandler):
                 if not isinstance(name, str) or not (value is None or isinstance(value, str)):
                     raise ValueError("expected {name: string, value: string or null}")
                 result = self.daemon.gui_set(name, value)
+            elif path == "/api/history/delete":
+                ts, wav = body.get("ts"), body.get("wav")
+                if not (ts is None or isinstance(ts, (int, float))) or not (wav is None or isinstance(wav, str)):
+                    raise ValueError("expected {ts: number or null, wav: string or null}")
+                result = {"message": self.daemon.delete_entry(ts, wav)}
             elif path == "/api/history/clear":
-                self.daemon.clear_history()
-                result = {"message": "History cleared."}
+                deleted = self.daemon.clear_history()
+                result = {"message": f"Cleared transcripts and deleted {deleted} recording file(s)."}
             else:
                 self.reply(404, {"error": "not found"})
                 return
@@ -1299,8 +1392,9 @@ button.small { font-size: 12.5px; padding: 3px 9px; }
 .live { flex: 1; min-width: 180px; }
 #message { font-size: 14px; color: var(--muted); min-height: 21px; }
 #message.warning { color: var(--warn); } #message.error { color: var(--rec); }
-.meter { height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; margin-top: 6px; }
-.meter b { display: block; height: 100%; width: 0; background: var(--rec); transition: width 90ms linear; }
+.bars { display: flex; align-items: center; gap: 3px; height: 24px; margin-top: 4px; }
+.bars b { display: block; width: 3px; height: 3px; border-radius: 2px; background: var(--line); }
+.bars.on b { background: var(--rec); }
 #scratch { width: 100%; margin-top: 14px; min-height: 68px; resize: vertical; font: inherit; color: var(--text);
   background: var(--field); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
 .group { font-size: 12.5px; color: var(--muted); font-weight: 600; margin: 16px 0 2px; }
@@ -1316,6 +1410,8 @@ button.small { font-size: 12.5px; padding: 3px 9px; }
 .entry { border-top: 1px solid var(--line); padding: 10px 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 12px; }
 .entry .meta { font-size: 12px; color: var(--muted); grid-column: 1 / -1; }
 .entry .text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.entry .actions { display: flex; gap: 6px; align-items: flex-start; }
+.entry audio { grid-column: 1 / -1; width: 100%; height: 36px; margin-top: 4px; }
 .empty { color: var(--muted); font-size: 14px; }
 footer { font-size: 12px; color: var(--muted); padding: 0 4px; overflow-wrap: anywhere; }
 footer div { margin-top: 2px; }
@@ -1341,7 +1437,7 @@ code { font: 12.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
       <button id="cancel" hidden>Cancel</button>
       <div class="live">
         <div id="message"></div>
-        <div class="meter" aria-hidden="true"><b id="level"></b></div>
+        <div id="bars" class="bars" aria-hidden="true"></div>
       </div>
     </div>
     <textarea id="scratch" aria-label="Scratch pad"
@@ -1354,7 +1450,7 @@ code { font: 12.5px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
   </section>
 
   <section aria-label="History">
-    <div class="sechead"><h2>Recent transcripts</h2><button id="clear" class="small" hidden>Clear</button></div>
+    <div class="sechead"><h2>Recent transcripts &amp; recordings</h2><button id="clear" class="small" hidden>Clear</button></div>
     <div id="history"><div class="empty">Loading…</div></div>
   </section>
 
@@ -1504,23 +1600,70 @@ async function copyText(text) {
   toast('Copied');
 }
 
+// <audio src> cannot send the token header, so fetch the WAV and play it from a blob URL.
+let audioUrls = [];
+async function playRecording(entry, row, button) {
+  button.disabled = true;
+  try {
+    const response = await fetch('/api/recording/' + encodeURIComponent(entry.wav), {headers: {'X-VTT-Token': token || ''}});
+    if (!response.ok) throw new Error(response.status === 404 ? 'Recording file is gone' : 'HTTP ' + response.status);
+    const url = URL.createObjectURL(await response.blob());
+    audioUrls.push(url);
+    row.append(el('audio', {controls: true, autoplay: true, src: url}));
+    button.remove();
+  } catch (e) {
+    button.disabled = false;
+    toast(e.message, true);
+  }
+}
+
 function renderHistory() {
   const box = $('history');
   box.replaceChildren();
+  audioUrls.forEach((url) => URL.revokeObjectURL(url));
+  audioUrls = [];
   $('clear').hidden = !info.history.length;
   if (!info.history.length) {
-    box.append(el('div', {className: 'empty', textContent: 'Nothing yet. Transcripts appear here after each recording.'}));
+    box.append(el('div', {className: 'empty', textContent: 'Nothing yet. Transcripts and recordings appear here after each recording.'}));
     return;
   }
   for (const entry of info.history) {
     const when = new Date(entry.ts * 1000).toLocaleString([], {dateStyle: 'medium', timeStyle: 'short'});
-    const meta = [when, entry.language, entry.audio_seconds != null ? entry.audio_seconds + ' s' : null];
-    const copy = el('button', {className: 'small', textContent: 'Copy'});
-    copy.addEventListener('click', () => copyText(entry.text));
-    box.append(el('div', {className: 'entry'},
+    const polished = entry.polished_by
+      ? 'polished by ' + ({ollama: 'Ollama', claude: 'Claude'}[entry.polished_by] || entry.polished_by) : null;
+    const meta = [when, entry.language, entry.audio_seconds != null ? entry.audio_seconds + ' s' : null, polished, entry.wav];
+    const actions = el('div', {className: 'actions'});
+    const row = el('div', {className: 'entry'},
       el('div', {className: 'meta', textContent: meta.filter(Boolean).join(' · ')}),
-      el('div', {className: 'text', textContent: entry.text}),
-      el('div', null, copy)));
+      entry.text != null ? el('div', {className: 'text', textContent: entry.text})
+        : el('div', {className: 'text empty', textContent: 'No transcript'}),
+      actions);
+    if (entry.text != null) {
+      const copy = el('button', {className: 'small', textContent: 'Copy'});
+      copy.addEventListener('click', () => copyText(entry.text));
+      actions.append(copy);
+    }
+    if (entry.wav) {
+      const play = el('button', {className: 'small', textContent: 'Play'});
+      play.addEventListener('click', () => playRecording(entry, row, play));
+      actions.append(play);
+    }
+    const hasText = entry.text != null;
+    const remove = el('button', {className: 'small', textContent: 'Delete',
+      title: 'Delete this ' + [hasText && 'transcript', entry.wav && 'recording'].filter(Boolean).join(' and ')});
+    remove.addEventListener('click', async () => {
+      if (!confirm(remove.title + '? This cannot be undone.')) return;
+      remove.disabled = true;
+      try {
+        toast((await api('/api/history/delete', {ts: hasText ? entry.ts : null, wav: entry.wav || null})).message);
+        await loadInfo(false);
+      } catch (e) {
+        remove.disabled = false;
+        toast(e.message, true);
+      }
+    });
+    actions.append(remove);
+    box.append(row);
   }
 }
 
@@ -1530,6 +1673,17 @@ async function loadInfo(withSettings) {
   pasteKey = info.paste_key;
   if (withSettings) renderSettings();
   renderHistory();
+}
+
+// Scrolling level bars, like the on-screen overlay: one bar per status poll while recording.
+const BAR_COUNT = 32, BAR_MIN = 3, BAR_MAX = 24;
+const levels = new Array(BAR_COUNT).fill(0);
+for (let i = 0; i < BAR_COUNT; i++) $('bars').append(el('b'));
+function renderBars(recording, level) {
+  if (recording) { levels.shift(); levels.push(Math.min(1, level || 0)); } else levels.fill(0);
+  $('bars').className = recording ? 'bars on' : 'bars';
+  const bars = $('bars').children;
+  for (let i = 0; i < BAR_COUNT; i++) bars[i].style.height = Math.round(BAR_MIN + levels[i] * (BAR_MAX - BAR_MIN)) + 'px';
 }
 
 let recordingSince = 0;
@@ -1543,10 +1697,10 @@ function renderStatus(st) {
   record.textContent = recording ? 'Stop' : 'Record';
   record.className = recording ? 'rec' : '';
   $('cancel').hidden = !recording;
-  $('level').style.width = (recording ? Math.round(Math.min(1, st.level || 0) * 100) : 0) + '%';
+  renderBars(recording, st.level);
   message.className = '';
   if (recording) {
-    const seconds = Math.floor((Date.now() - recordingSince) / 1000);
+    const seconds = Math.floor(st.elapsed != null ? st.elapsed : (Date.now() - recordingSince) / 1000);
     message.textContent = 'Listening… ' + Math.floor(seconds / 60) + ':' + String(seconds % 60).padStart(2, '0');
     pill.className = 'pill rec'; $('pilltext').textContent = 'Recording';
   } else if (busy) {
@@ -1567,7 +1721,7 @@ function renderStatus(st) {
 function disconnected(error) {
   $('record').disabled = true;
   $('cancel').hidden = true;
-  $('level').style.width = '0%';
+  renderBars(false, 0);
   $('pill').className = 'pill off';
   $('pilltext').textContent = 'Disconnected';
   $('message').className = 'error';
@@ -1599,8 +1753,8 @@ $('cancel').addEventListener('click', async () => {
   try { await api('/api/cancel', {}); } catch (e) { toast(e.message, true); }
 });
 $('clear').addEventListener('click', async () => {
-  if (!confirm('Delete all saved transcripts?')) return;
-  try { await api('/api/history/clear', {}); await loadInfo(false); } catch (e) { toast(e.message, true); }
+  if (!confirm('Delete all saved transcripts and recording files? This cannot be undone.')) return;
+  try { toast((await api('/api/history/clear', {})).message); await loadInfo(false); } catch (e) { toast(e.message, true); }
 });
 // Pick up settings changed elsewhere (vtt set …) when coming back to the tab, unless a field is being edited.
 window.addEventListener('focus', () => {
@@ -1661,6 +1815,25 @@ def run_mac_overlay(parent_pid: int) -> None:
     label.setFont_(NSFont.systemFontOfSize_weight_(14, 0.3))
     pill.addSubview_(label)
 
+    # Level bars, shown while recording between the dot and the timer (newest level on the right).
+    bar_count, bar_width, bar_gap, bar_min, bar_max = 14, 3.0, 3.0, 3.0, 22.0
+    bars_x = 38.0
+    bars_width = bar_count * (bar_width + bar_gap) - bar_gap
+    bars = []
+    for i in range(bar_count):
+        bar = NSView.alloc().initWithFrame_(
+            NSMakeRect(bars_x + i * (bar_width + bar_gap), (height - bar_min) / 2, bar_width, bar_min))
+        bar.setWantsLayer_(True)
+        bar.layer().setCornerRadius_(bar_width / 2)
+        bar.layer().setBackgroundColor_(CGColorCreateGenericGray(1.0, 0.9))
+        bar.setHidden_(True)
+        pill.addSubview_(bar)
+        bars.append(bar)
+    levels = [0.0] * bar_count
+    label_frames = {False: NSMakeRect(38, (height - 20) / 2, width - 54, 20),  # status text
+                    True: NSMakeRect(bars_x + bars_width + 12, (height - 20) / 2,
+                                     width - (bars_x + bars_width + 12) - 16, 20)}  # timer right of the bars
+
     colors = {"recording": (1.0, 0.27, 0.23), "processing": (1.0, 0.8, 0.0),
               "pasting": (1.0, 0.8, 0.0), "error": (1.0, 0.27, 0.23), "warning": (1.0, 0.62, 0.04)}
     shown = {"key": None, "since": 0.0}
@@ -1688,10 +1861,22 @@ def run_mac_overlay(parent_pid: int) -> None:
             level = float(state.get("level", 0))
             if shown["key"] != "recording":
                 shown["since"] = now
-            elapsed = int(now - shown["since"])
-            text, alpha = f"Recording  {elapsed // 60}:{elapsed % 60:02d}", 0.55 + 0.45 * min(1.0, level)
+                levels[:] = [0.0] * bar_count
+            elapsed = int(state.get("elapsed", now - shown["since"]))
+            text, alpha = f"{elapsed // 60}:{elapsed % 60:02d}", 0.55 + 0.45 * min(1.0, level)
+            levels.pop(0)
+            levels.append(max(0.0, min(1.0, level)))
+            for i, bar in enumerate(bars):
+                bar_height = bar_min + levels[i] * (bar_max - bar_min)
+                bar.setFrame_(NSMakeRect(bars_x + i * (bar_width + bar_gap), (height - bar_height) / 2,
+                                         bar_width, bar_height))
         else:
             text, alpha = message or "Working…", 1.0
+        recording = name == "recording"
+        if (shown["key"] == "recording") != recording or shown["key"] is None:
+            for bar in bars:
+                bar.setHidden_(not recording)
+            label.setFrame_(label_frames[recording])
         shown["key"] = name
         r, g, b = colors[name]
         dot.layer().setBackgroundColor_(CGColorCreateGenericRGB(r, g, b, alpha))
