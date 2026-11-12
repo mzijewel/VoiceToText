@@ -34,6 +34,7 @@ else:
 import numpy as np
 import sounddevice as sd
 from faster_whisper import WhisperModel
+from faster_whisper.utils import download_model
 
 
 
@@ -1025,6 +1026,14 @@ class VoiceToTextDaemon:
     def loaded_model(self) -> str:
         return f"{self.model_key[0]} ({self.model_key[1]})" if self.model_key else "not loaded yet"
 
+    def downloaded_model_path(self) -> str | None:
+        """Local directory the downloaded Whisper model lives in (Hugging Face cache); None if not downloaded yet."""
+        try:
+            return download_model(SETTINGS["model"], local_files_only=True)
+        except Exception as exc:
+            log.debug("Could not resolve downloaded Whisper model path: %s", exc)
+            return None
+
     def start_gui(self) -> str:
         """Start the web UI server on first use; returns its URL (with the access token)."""
         if self.gui_url is None:
@@ -1066,6 +1075,7 @@ class VoiceToTextDaemon:
             "devices": devices,
             "ollama_models": ollama,
             "loaded_model": self.loaded_model(),
+            "model_path": self.downloaded_model_path(),
             "last_mic": self.input_device,
             "config_path": str(CONFIG_PATH),
             "log_path": str(LOG_PATH),
@@ -1843,7 +1853,7 @@ function renderSettings() {
   }
   const foot = $('footer');
   foot.replaceChildren(
-    el('div', {textContent: 'Loaded model: ' + info.loaded_model + ' · Last microphone: ' + info.last_mic}),
+    el('div', null, 'Downloaded model: ', el('code', {textContent: info.model_path || 'not downloaded yet'})),
     el('div', null, 'Settings file: ', el('code', {textContent: info.config_path})),
     el('div', null, 'Log: ', el('code', {textContent: info.log_path})),
   );
