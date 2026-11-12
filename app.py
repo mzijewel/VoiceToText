@@ -150,7 +150,8 @@ def format_settings(extra: dict[str, str] | None = None) -> str:
     width = max(len(v) for v in SETTINGS.values())
     for name, (_, _, choices) in SETTING_SPECS.items():
         hint = f"  [{' | '.join(choices)}]" if choices else ""
-        lines.append(f"{name:<13} {SETTINGS[name]:<{width}} ({SETTING_SOURCES[name]}){hint}")
+        value, source = effective_hotkey() if name == "hotkey" else (SETTINGS[name], SETTING_SOURCES[name])
+        lines.append(f"{name:<13} {value:<{width}} ({source}){hint}")
     for key, value in (extra or {}).items():
         lines.append(f"{key:<13} {value}")
     lines.append(f"config file   {CONFIG_PATH}")
@@ -415,8 +416,115 @@ def parse_windows_hotkey(combo: str) -> tuple[int, int]:
     return mods, vk
 
 
+GNOME_KEYS_SCHEMA = "org.gnome.settings-daemon.plugins.media-keys"
+GNOME_KEY_PATH = "/org/gnome/settings-daemon/plugins/media-keys/custom-keybindings/voice-to-text/"
+GNOME_MODIFIERS = {"ctrl": "Control", "alt": "Alt", "shift": "Shift", "cmd": "Super"}
+GNOME_MODIFIER_NAMES = {"control": "ctrl", "ctrl": "ctrl", "primary": "ctrl", "alt": "alt", "mod1": "alt",
+                        "shift": "shift", "super": "cmd", "meta": "cmd", "mod4": "cmd"}
+GNOME_KEYS = {  # pynput key name -> X keysym name
+    "space": "space", "enter": "Return", "tab": "Tab", "esc": "Escape", "backspace": "BackSpace",
+    "insert": "Insert", "delete": "Delete", "home": "Home", "end": "End", "page_up": "Page_Up",
+    "page_down": "Page_Down", "up": "Up", "down": "Down", "left": "Left", "right": "Right",
+    "pause": "Pause", "scroll_lock": "Scroll_Lock",
+    "-": "minus", "=": "equal", ",": "comma", ".": "period", "/": "slash", ";": "semicolon",
+    "'": "apostrophe", "[": "bracketleft", "]": "bracketright", "\\": "backslash", "`": "grave",
+}
+GNOME_KEY_NAMES = {keysym.lower(): name for name, keysym in GNOME_KEYS.items()}
+_gnome_shortcuts: bool | None = None
+
+
+def gsettings(*args: str) -> str | None:
+    """Run gsettings; stdout, or None when it fails."""
+    # /usr/bin first: a Linuxbrew gsettings may target a different dconf (see install-shortcut.sh).
+    exe = "/usr/bin/gsettings" if os.path.exists("/usr/bin/gsettings") else shutil.which("gsettings")
+    if not exe:
+        return None
+    try:
+        result = subprocess.run([exe, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def gnome_shortcuts() -> bool:
+    """True on GNOME, where the global shortcut is a GNOME custom keybinding that runs `app.py toggle`."""
+    global _gnome_shortcuts
+    if _gnome_shortcuts is None:
+        _gnome_shortcuts = IS_LINUX and gsettings("get", GNOME_KEYS_SCHEMA, "custom-keybindings") is not None
+    return _gnome_shortcuts
+
+
+def hotkey_to_gnome(combo: str) -> str:
+    """pynput-style "<ctrl>+<alt>+<space>" -> GNOME "<Control><Alt>space" ("off" -> "")."""
+    if combo == "off":
+        return ""
+    mods, key = "", None
+    for part in combo.lower().split("+"):
+        name = part.strip().strip("<>").removesuffix("_l").removesuffix("_r")
+        if name in GNOME_MODIFIERS:
+            mods += f"<{GNOME_MODIFIERS[name]}>"
+            continue
+        if key is not None:
+            raise ValueError("only one non-modifier key is allowed")
+        if name in GNOME_KEYS:
+            key = GNOME_KEYS[name]
+        elif len(name) == 1 and name.isascii() and name.isalnum():
+            key = name
+        elif name[:1] == "f" and name[1:].isdigit() and 1 <= int(name[1:]) <= 24:
+            key = name.upper()
+        else:
+            raise ValueError(f"unknown key {part.strip()!r}")
+    if key is None:
+        raise ValueError("the hotkey needs a non-modifier key, e.g. <ctrl>+<alt>+<space>")
+    return mods + key
+
+
+def gnome_to_hotkey(binding: str) -> str:
+    """GNOME "<Control><Alt>space" -> pynput-style "<ctrl>+<alt>+<space>" ("" -> "off")."""
+    parts = [f"<{GNOME_MODIFIER_NAMES.get(m.lower(), m.lower())}>" for m in re.findall(r"<([^>]+)>", binding)]
+    key = re.sub(r"<[^>]+>", "", binding).strip().lower()
+    if not key:
+        return "off"
+    key = GNOME_KEY_NAMES.get(key, key)
+    return "+".join(parts + [key if len(key) == 1 else f"<{key}>"])
+
+
+def gnome_hotkey() -> str:
+    """The key currently bound to the Voice to Text GNOME shortcut, pynput-style ("off" if none)."""
+    binding = gsettings("get", f"{GNOME_KEYS_SCHEMA}.custom-keybinding:{GNOME_KEY_PATH}", "binding") or "''"
+    return gnome_to_hotkey(binding.strip("'\""))
+
+
+def set_gnome_hotkey(combo: str) -> None:
+    """Bind the GNOME shortcut to `combo`, creating the shortcut (-> `app.py toggle`) if it is missing."""
+    entry = f"{GNOME_KEYS_SCHEMA}.custom-keybinding:{GNOME_KEY_PATH}"
+    current = gsettings("get", GNOME_KEYS_SCHEMA, "custom-keybindings")
+    if current is None:
+        raise RuntimeError("gsettings is not available")
+    if GNOME_KEY_PATH not in current:
+        if combo == "off":
+            return
+        paths = re.findall(r"'([^']+)'", current) + [GNOME_KEY_PATH]
+        gsettings("set", entry, "name", "Voice to Text")
+        gsettings("set", entry, "command", f"{sys.executable} {Path(__file__).resolve()} toggle")
+        gsettings("set", GNOME_KEYS_SCHEMA, "custom-keybindings", str(paths))
+    if gsettings("set", entry, "binding", hotkey_to_gnome(combo)) is None:
+        raise RuntimeError("gsettings could not set the binding")
+
+
+def effective_hotkey() -> tuple[str, str]:
+    """(hotkey, where it comes from): on GNOME, the key GNOME's shortcut is really bound to."""
+    source = SETTING_SOURCES["hotkey"]
+    if gnome_shortcuts():
+        return gnome_hotkey(), "GNOME shortcut" if source == "default" else source
+    return SETTINGS["hotkey"], source
+
+
 def validate_hotkey(combo: str) -> None:
     if combo == "off":
+        return
+    if gnome_shortcuts():
+        hotkey_to_gnome(combo)
         return
     if IS_WINDOWS:
         parse_windows_hotkey(combo)
@@ -541,6 +649,19 @@ class VoiceToTextDaemon:
     def setup_hotkey(self) -> None:
         """(Re)start the global hotkey listener to match the `hotkey` setting."""
         combo = SETTINGS["hotkey"]
+        if gnome_shortcuts():
+            # pynput can't grab keys on Wayland; GNOME's own shortcut runs `app.py toggle`, so rebind that.
+            # An unset `hotkey` leaves whatever the installer / GNOME Settings bound.
+            if SETTING_SOURCES["hotkey"] != "default":
+                try:
+                    if gnome_hotkey() != gnome_to_hotkey(hotkey_to_gnome(combo)):
+                        set_gnome_hotkey(combo)
+                        log.info("GNOME shortcut set to %s", combo)
+                except ValueError as exc:
+                    log.warning("Ignoring invalid hotkey %r: %s", combo, exc)
+                except Exception:
+                    log.exception("Could not set the GNOME shortcut to %s", combo)
+            return
         if self.hotkey and self.hotkey.combo == combo:
             return
         if self.hotkey:
@@ -926,12 +1047,17 @@ class VoiceToTextDaemon:
         except Exception as exc:
             log.warning("Could not list input devices: %s", exc)
             devices = []
+        settings = [
+            {"name": name, "value": SETTINGS[name], "source": SETTING_SOURCES[name],
+             "default": default, "choices": choices}
+            for name, (_, default, choices) in SETTING_SPECS.items()
+        ]
+        for setting in settings:
+            if setting["name"] == "hotkey":
+                setting["value"], setting["source"] = effective_hotkey()
         return {
-            "settings": [
-                {"name": name, "value": SETTINGS[name], "source": SETTING_SOURCES[name],
-                 "default": default, "choices": choices}
-                for name, (_, default, choices) in SETTING_SPECS.items()
-            ],
+            "settings": settings,
+            "super_key": "Cmd" if IS_MAC else "Win" if IS_WINDOWS else "Super",
             "devices": devices,
             "loaded_model": self.loaded_model(),
             "last_mic": self.input_device,
@@ -1452,6 +1578,8 @@ button.small { font-size: 12.5px; padding: 3px 9px; }
 .ctl { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
 .ctl select, .ctl input { width: 100%; font: inherit; color: var(--text); background: var(--field);
   border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; min-width: 0; }
+.ctl input.keys { cursor: pointer; caret-color: transparent; }
+.ctl input.keys:focus { border-color: var(--accent, #4a8cff); }
 .src { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; color: var(--muted); }
 .entry { border-top: 1px solid var(--line); padding: 10px 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 12px; }
 .entry .meta { font-size: 12px; color: var(--muted); grid-column: 1 / -1; }
@@ -1553,7 +1681,7 @@ const LABELS = {
   language: ['Language', 'Auto-detect picks Bangla or English for each recording'],
   model: ['Whisper model', 'Larger models are more accurate but slower; loaded on the next transcription'],
   device: ['Microphone', 'Auto uses the system default input'],
-  hotkey: ['Global hotkey', 'For example <ctrl>+<alt>+<space>, or off'],
+  hotkey: ['Global hotkey', 'Click the field, then press the shortcut. Backspace turns it off, Esc cancels'],
   sounds: ['Sound cues', 'Beep on start, stop and problems'],
   cleanup: ['Cleanup', 'Polish the transcript with an LLM before pasting'],
   ollama_model: ['Ollama model', 'Must already be installed in Ollama'],
@@ -1583,6 +1711,63 @@ async function saveSetting(name, value) {
   await loadInfo(true);
 }
 
+// KeyboardEvent.code -> pynput-style key name (the physical key, so Shift/layout don't change it)
+const KEY_CODES = {
+  Space: '<space>', Enter: '<enter>', Tab: '<tab>', Insert: '<insert>', Home: '<home>', End: '<end>',
+  PageUp: '<page_up>', PageDown: '<page_down>', ArrowUp: '<up>', ArrowDown: '<down>', ArrowLeft: '<left>',
+  ArrowRight: '<right>', Pause: '<pause>', ScrollLock: '<scroll_lock>', Escape: '<esc>', Backspace: '<backspace>',
+  Delete: '<delete>', Minus: '-', Equal: '=', Comma: ',', Period: '.', Slash: '/', Semicolon: ';', Quote: "'",
+  BracketLeft: '[', BracketRight: ']', Backquote: '`',
+  Backslash: String.fromCharCode(92),  // no literal backslash: this page lives in a Python string
+};
+const MODIFIER_KEYS = ['Control', 'Alt', 'Shift', 'Meta', 'OS', 'AltGraph'];
+
+function keyName(e) {
+  let m;
+  if ((m = /^Key([A-Z])$/.exec(e.code))) return m[1].toLowerCase();
+  if ((m = /^Digit([0-9])$/.exec(e.code))) return m[1];
+  if ((m = /^F([0-9]{1,2})$/.exec(e.code))) return '<f' + m[1] + '>';
+  return KEY_CODES[e.code] || null;
+}
+
+function prettyHotkey(combo) {
+  if (!combo || combo === 'off') return 'Off';
+  return combo.split('+').map((part) => {
+    const name = part.trim().replace(/^<|>$/g, '');
+    if (name === 'cmd') return info.super_key;
+    return name.split('_').map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+  }).join(' + ');
+}
+
+function hotkeyControl(s, id) {
+  const control = el('input', {id, type: 'text', className: 'keys', readOnly: true, value: prettyHotkey(s.value),
+    title: s.value});
+  const show = () => { control.value = prettyHotkey(s.value); control.placeholder = ''; };
+  control.addEventListener('focus', () => { control.value = ''; control.placeholder = 'Press the shortcut…'; });
+  control.addEventListener('blur', show);
+  control.addEventListener('keydown', (e) => {
+    if (e.key === 'Tab' && !e.ctrlKey && !e.altKey && !e.metaKey) return;  // keep keyboard navigation
+    e.preventDefault();
+    e.stopPropagation();
+    if (MODIFIER_KEYS.includes(e.key)) return;  // wait for the real key
+    const strong = e.ctrlKey || e.altKey || e.metaKey;
+    if (!strong && !e.shiftKey && e.key === 'Escape') { control.blur(); return; }
+    let combo;
+    if (!strong && !e.shiftKey && (e.key === 'Backspace' || e.key === 'Delete')) {
+      combo = 'off';
+    } else {
+      const key = keyName(e);
+      if (!key) { toast('That key cannot be used in a shortcut', true); return; }
+      if (!strong && !/^<f[0-9]+>$/.test(key)) { toast('Add Ctrl, Alt or ' + info.super_key + ' to the shortcut', true); return; }
+      combo = [e.ctrlKey && '<ctrl>', e.altKey && '<alt>', e.shiftKey && '<shift>', e.metaKey && '<cmd>', key]
+        .filter(Boolean).join('+');
+    }
+    control.blur();
+    if (combo !== s.value) saveSetting(s.name, combo);
+  });
+  return control;
+}
+
 function settingRow(s, devices) {
   const [label, hint] = LABELS[s.name] || [s.name, ''];
   const id = 'set-' + s.name;
@@ -1594,7 +1779,9 @@ function settingRow(s, devices) {
     for (const d of devices) names[d.name] = d.label;
   }
   let control;
-  if (options) {
+  if (s.name === 'hotkey') {
+    control = hotkeyControl(s, id);
+  } else if (options) {
     if (!options.includes(s.value)) options = [...options, s.value];
     control = el('select', {id});
     for (const o of options) control.append(el('option', {value: o, textContent: names[o] || o}));
