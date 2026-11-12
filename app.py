@@ -192,15 +192,58 @@ def setup_logging(role: str) -> None:
     )
 
 
+PORTAUDIO_LOCK = threading.Lock()  # the recorder and the device listing must not re-init PortAudio at once
+
+
+def refresh_portaudio() -> None:
+    """PortAudio snapshots devices and its PulseAudio connection at init; re-init to see the current ones."""
+    with PORTAUDIO_LOCK:
+        start = time.perf_counter()
+        sd.stop()  # close the previous cue's sd.play stream first; terminating under it kills later input streams
+        sd._terminate()
+        sd._initialize()
+        log.debug("Re-initialized PortAudio in %.3fs", time.perf_counter() - start)
+
+
+def pipewire_sources() -> list[dict[str, str]]:
+    """PipeWire's microphones as {name, label}: the node name PortAudio opens and the name the desktop shows.
+
+    PortAudio's own list only has the node names (a Bluetooth headset is `bluez_input.<MAC>`), mixed
+    with raw ALSA hw devices (which reject 16 kHz) and output monitors.
+    """
+    if not IS_LINUX or not shutil.which("pw-dump"):
+        return []
+    try:
+        dump = json.loads(subprocess.run(
+            ["pw-dump"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=2, check=True).stdout)
+    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+        log.debug("Could not list PipeWire sources: %s", exc)
+        return []
+    sources = []
+    for obj in dump:
+        props = (obj.get("info") or {}).get("props") or {}
+        name = props.get("node.name")
+        if name and str(props.get("media.class", "")).startswith("Audio/Source"):
+            sources.append({"name": name, "label": props.get("node.description") or name})
+    return sources
+
+
+def input_devices(refresh: bool = False) -> list[dict[str, str]]:
+    """Microphones to offer for the `device` setting, as {name, label}."""
+    sources = pipewire_sources()
+    if sources:
+        return sources
+    if refresh:
+        refresh_portaudio()
+    names = dict.fromkeys(d["name"] for d in sd.query_devices() if d["max_input_channels"] > 0)
+    return [{"name": name, "label": name} for name in names]
+
+
 def pick_input_device() -> int | str | None:
     """Raw ALSA hw devices reject 16 kHz, so prefer the PulseAudio/PipeWire default source."""
-    # PortAudio snapshots devices and its PulseAudio connection at init; re-init so a PipeWire
-    # restart or a hot-plugged mic doesn't leave the long-running daemon with a dead stream.
-    start = time.perf_counter()
-    sd.stop()  # close the previous cue's sd.play stream first; terminating under it kills later input streams
-    sd._terminate()
-    sd._initialize()
-    log.debug("Re-initialized PortAudio in %.3fs", time.perf_counter() - start)
+    # Re-init so a PipeWire restart or a hot-plugged mic doesn't leave the long-running daemon
+    # with a dead stream.
+    refresh_portaudio()
     override = SETTINGS["device"]
     if override != "auto":
         log.info("Using configured input device: %r", override)
@@ -878,7 +921,8 @@ class VoiceToTextDaemon:
 
     def gui_info(self) -> dict:
         try:
-            devices = list(dict.fromkeys(d["name"] for d in sd.query_devices() if d["max_input_channels"] > 0))
+            # Re-initializing PortAudio would kill a stream that is in use, so only refresh when idle.
+            devices = input_devices(refresh=not (self.worker and self.worker.is_alive()))
         except Exception as exc:
             log.warning("Could not list input devices: %s", exc)
             devices = []
@@ -1168,10 +1212,12 @@ def cleanup_with(provider: str, text: str) -> str:
 
 
 def list_input_devices() -> str:
+    labels = {d["name"]: d["label"] for d in pipewire_sources()}
     lines = [f"{'#':>3}  {'ch':>2}  name"]
     for index, dev in enumerate(sd.query_devices()):
         if dev["max_input_channels"] > 0:
-            lines.append(f"{index:>3}  {dev['max_input_channels']:>2}  {dev['name']}")
+            label = labels.get(dev["name"])
+            lines.append(f"{index:>3}  {dev['max_input_channels']:>2}  {dev['name']}" + (f"  ({label})" if label else ""))
     lines.append("\nUse a name with: app.py set device '<name>'  (indexes can change when devices are plugged in)")
     return "\n".join(lines)
 
@@ -1541,12 +1587,16 @@ function settingRow(s, devices) {
   const [label, hint] = LABELS[s.name] || [s.name, ''];
   const id = 'set-' + s.name;
   let options = s.choices;
-  if (s.name === 'device') options = ['auto', ...devices];
+  const names = {...VALUE_NAMES[s.name]};
+  if (s.name === 'device') {
+    options = ['auto', ...devices.map((d) => d.name)];
+    names.auto = 'Auto (system default)';
+    for (const d of devices) names[d.name] = d.label;
+  }
   let control;
   if (options) {
     if (!options.includes(s.value)) options = [...options, s.value];
     control = el('select', {id});
-    const names = VALUE_NAMES[s.name] || {};
     for (const o of options) control.append(el('option', {value: o, textContent: names[o] || o}));
     control.value = s.value;
   } else {
