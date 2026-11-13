@@ -633,6 +633,7 @@ class VoiceToTextDaemon:
         self.input_device = "not used yet"
         self.lock = threading.Lock()
         self.recording = False
+        self.regenerating = False  # a web UI "Regenerate" is using the model (see regenerate)
         self.stop_event = threading.Event()
         self.worker: threading.Thread | None = None
         self.server: socket.socket | None = None
@@ -738,6 +739,8 @@ class VoiceToTextDaemon:
                 log.info("Toggle: stopping recording")
                 self.stop_event.set()
                 return "Stopping recording…"
+            if self.regenerating:
+                return "Busy regenerating a transcript; try again in a moment."
             log.info("Toggle: starting recording")
             self.recording = True
             self.cancelled = False
@@ -838,34 +841,8 @@ class VoiceToTextDaemon:
             self.write_state("processing", message="Preparing…")
             # notify("Transcribing locally…")
             processing_start = time.perf_counter()
-            model = self.load_model()
-            load_seconds = time.perf_counter() - processing_start
-            transcribe_start = time.perf_counter()
-            lang = None if SETTINGS["language"].lower() == "auto" else SETTINGS["language"].lower()
-            self.write_state("processing", message="Transcribing…")
-            log.info("Transcribing: model=%s language=%s beam_size=5 vad_filter=True", SETTINGS["model"], lang or "auto")
-            segments, info = model.transcribe(
-                audio,  # pass the array; avoids PyAV file decoding
-                language=lang,
-                beam_size=5,
-                vad_filter=True,
-                condition_on_previous_text=False,
-            )
-            log.info("Detected language %s (p=%.2f); duration %.2fs, after VAD %.2fs",
-                     info.language, info.language_probability, info.duration,
-                     getattr(info, "duration_after_vad", float("nan")))
-            parts: list[str] = []
-            for seg in segments:  # generator: decoding happens while iterating
-                log.debug("Segment %d [%.2f-%.2f] avg_logprob=%.3f no_speech=%.3f compression=%.2f: %r",
-                          seg.id, seg.start, seg.end, seg.avg_logprob, seg.no_speech_prob,
-                          seg.compression_ratio, seg.text)
-                parts.append(seg.text)
-                if info.duration > 0:
-                    pct = min(99, int(seg.end / info.duration * 100))
-                    self.write_state("processing", message=f"Transcribing… {pct}%")
-            text = "".join(parts).strip()
-            transcribe_seconds = time.perf_counter() - transcribe_start
-            log.info("Transcribed %d segment(s) in %.2fs", len(parts), transcribe_seconds)
+            text, language, load_seconds, transcribe_seconds = self.transcribe(audio)
+            raw_text = text
             if not text:
                 # notify("No speech recognized.")
                 log.warning("No speech recognized")
@@ -897,8 +874,8 @@ class VoiceToTextDaemon:
                 # notify("Text copied, but auto-paste failed. Paste with Ctrl+V.", popup=True)
                 notice = ("warning", f"Copied — auto-paste failed, press {'Cmd' if IS_MAC else 'Ctrl'}+V")
             total_seconds = time.perf_counter() - processing_start
-            log.info("Transcription (%s): %s", info.language, text)
-            self.add_history(text, info.language, duration, wav_path.name, polished_by)
+            log.info("Transcription (%s): %s", language, text)
+            self.add_history(text, language, duration, wav_path.name, polished_by, raw_text)
             log.info("Timing: audio %.1fs | model load %.2fs | transcribe %.2fs | cleanup %.2fs | "
                      "total after recording %.2fs",
                      duration, load_seconds, transcribe_seconds, cleanup_seconds, total_seconds)
@@ -918,6 +895,129 @@ class VoiceToTextDaemon:
                 if not IS_LINUX:  # no overlay to show it
                     play_cue("problem")
                     notify(notice[1], popup=True)
+            else:
+                self.write_state("idle")
+
+    def transcribe(self, audio: np.ndarray) -> tuple[str, str, float, float]:
+        """Run Whisper on 16 kHz mono float32 audio with the current settings, reporting progress via write_state.
+
+        Returns (text, detected language, model load seconds, transcribe seconds).
+        """
+        load_start = time.perf_counter()
+        model = self.load_model()
+        load_seconds = time.perf_counter() - load_start
+        transcribe_start = time.perf_counter()
+        lang = None if SETTINGS["language"].lower() == "auto" else SETTINGS["language"].lower()
+        self.write_state("processing", message="Transcribing…")
+        log.info("Transcribing: model=%s language=%s beam_size=5 vad_filter=True", SETTINGS["model"], lang or "auto")
+        segments, info = model.transcribe(
+            audio,  # pass the array; avoids PyAV file decoding
+            language=lang,
+            beam_size=5,
+            vad_filter=True,
+            condition_on_previous_text=False,
+        )
+        log.info("Detected language %s (p=%.2f); duration %.2fs, after VAD %.2fs",
+                 info.language, info.language_probability, info.duration,
+                 getattr(info, "duration_after_vad", float("nan")))
+        parts: list[str] = []
+        for seg in segments:  # generator: decoding happens while iterating
+            log.debug("Segment %d [%.2f-%.2f] avg_logprob=%.3f no_speech=%.3f compression=%.2f: %r",
+                      seg.id, seg.start, seg.end, seg.avg_logprob, seg.no_speech_prob,
+                      seg.compression_ratio, seg.text)
+            parts.append(seg.text)
+            if info.duration > 0:
+                pct = min(99, int(seg.end / info.duration * 100))
+                self.write_state("processing", message=f"Transcribing… {pct}%")
+        transcribe_seconds = time.perf_counter() - transcribe_start
+        log.info("Transcribed %d segment(s) in %.2fs", len(parts), transcribe_seconds)
+        return "".join(parts).strip(), info.language, load_seconds, transcribe_seconds
+
+    def regenerate(self, ts: float | None, wav: str | None, provider: str) -> str:
+        """Start redoing one web UI row in the background: re-transcribe its WAV (or reuse its raw text when the
+        file is gone), then polish with `provider` (none|ollama|claude, no fallback). Updates history in place."""
+        if provider not in ("none", "ollama", "claude"):
+            raise ValueError("provider must be none, ollama or claude")
+        if wav is not None and not RECORDING_RE.fullmatch(wav):  # also keeps the path inside APP_DIR
+            raise ValueError("bad recording name")
+        with self.lock:
+            if self.recording or self.regenerating:
+                raise ValueError("Busy recording or transcribing; try again when it finishes.")
+            entry = next((e for e in self.history if ts is not None and e.get("ts") == ts), None)
+            if entry is None and wav is None:
+                raise ValueError("That transcript is no longer in the history.")
+            self.regenerating = True  # keeps toggle and other regenerations out while the model is in use
+        threading.Thread(target=self.regenerate_worker, args=(entry, wav, provider),
+                         name="regenerate", daemon=True).start()
+        return "Regenerating…"
+
+    def regenerate_worker(self, entry: dict | None, wav: str | None, provider: str) -> None:
+        notice: tuple[str, str] | None = None
+        try:
+            self.write_state("processing", message="Preparing…")
+            audio_seconds = entry.get("audio_seconds") if entry else None
+            language = entry.get("language") if entry else None
+            wav_path = APP_DIR / wav if wav else None
+            if wav_path and wav_path.exists():
+                import wave
+                with wave.open(str(wav_path), "rb") as wf:
+                    if wf.getframerate() != SAMPLE_RATE or wf.getnchannels() != 1 or wf.getsampwidth() != 2:
+                        raise ValueError(f"{wav} is not 16 kHz mono 16-bit audio")
+                    pcm = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
+                audio = pcm.astype(np.float32) / 32767
+                audio_seconds = len(audio) / SAMPLE_RATE
+                log.info("Regenerating from %s (%.2fs) with cleanup=%s", wav, audio_seconds, provider)
+                text, language, _, _ = self.transcribe(audio)
+            elif entry:
+                wav = None
+                text = entry.get("raw", entry["text"])
+                log.info("Regenerating transcript %s (recording gone) with cleanup=%s", entry["ts"], provider)
+            else:
+                raise FileNotFoundError("Recording file is gone")
+            if not text:
+                notice = ("warning", "No speech recognized")
+                return
+            raw_text, polished_by = text, None
+            if provider != "none":
+                name = {"ollama": "Ollama", "claude": "Claude"}[provider]
+                self.write_state("processing", message=f"Polishing with {name}…")
+                try:
+                    text, polished_by = cleanup_with(provider, raw_text), provider
+                except Exception as exc:
+                    log.warning("Regenerate cleanup with %s failed: %s", provider, exc)
+                    notice = ("warning", f"{name} cleanup failed — kept the raw transcript")
+            ts = entry["ts"] if entry else int(RECORDING_RE.fullmatch(wav)[1])
+            with self.lock:
+                current = next((e for e in self.history if e.get("ts") == ts), None)
+                if current is None:
+                    current = {"ts": ts}
+                    self.history.append(current)
+                    self.history.sort(key=lambda e: e.get("ts", 0))
+                    del self.history[:-HISTORY_LIMIT]
+                current.update(text=text, language=language)
+                if raw_text != text:
+                    current["raw"] = raw_text
+                else:
+                    current.pop("raw", None)
+                if audio_seconds is not None:
+                    current["audio_seconds"] = round(audio_seconds, 1)
+                if wav:
+                    current["wav"] = wav
+                if polished_by:
+                    current["polished_by"] = polished_by
+                else:
+                    current.pop("polished_by", None)
+                self.history_version += 1
+                save_history(self.history)
+            log.info("Regenerated (%s, cleanup=%s): %s", language, polished_by or "none", text)
+        except Exception as exc:
+            log.exception("Regenerate failed")
+            notice = ("error", f"Regenerate failed: {exc}")
+        finally:
+            with self.lock:
+                self.regenerating = False
+            if notice:
+                self.write_state(notice[0], message=notice[1])
             else:
                 self.write_state("idle")
 
@@ -948,11 +1048,12 @@ class VoiceToTextDaemon:
         return True
 
     def add_history(self, text: str, language: str, audio_seconds: float, wav: str,
-                    polished_by: str | None = None) -> None:
+                    polished_by: str | None = None, raw: str | None = None) -> None:
         with self.lock:
             self.history.append({"ts": time.time(), "text": text, "language": language,
                                  "audio_seconds": round(audio_seconds, 1), "wav": wav,
-                                 **({"polished_by": polished_by} if polished_by else {})})
+                                 **({"polished_by": polished_by} if polished_by else {}),
+                                 **({"raw": raw} if raw and raw != text else {})})
             del self.history[:-HISTORY_LIMIT]
             self.history_version += 1
             save_history(self.history)
@@ -1523,6 +1624,12 @@ class GuiHandler(http.server.BaseHTTPRequestHandler):
                 if not (ts is None or isinstance(ts, (int, float))) or not (wav is None or isinstance(wav, str)):
                     raise ValueError("expected {ts: number or null, wav: string or null}")
                 result = {"message": self.daemon.delete_entry(ts, wav)}
+            elif path == "/api/history/regenerate":
+                ts, wav, provider = body.get("ts"), body.get("wav"), body.get("provider")
+                if not (ts is None or isinstance(ts, (int, float))) or not (wav is None or isinstance(wav, str)) \
+                        or not isinstance(provider, str):
+                    raise ValueError("expected {ts: number or null, wav: string or null, provider: string}")
+                result = {"message": self.daemon.regenerate(ts, wav, provider)}
             elif path == "/api/history/clear":
                 deleted = self.daemon.clear_history()
                 result = {"message": f"Cleared transcripts and deleted {deleted} recording file(s)."}
@@ -1605,7 +1712,10 @@ button.small { font-size: 12.5px; padding: 3px 9px; }
 .entry { border-top: 1px solid var(--line); padding: 10px 0; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 12px; }
 .entry .meta { font-size: 12px; color: var(--muted); grid-column: 1 / -1; }
 .entry .text { white-space: pre-wrap; overflow-wrap: anywhere; }
-.entry .actions { display: flex; gap: 6px; align-items: flex-start; }
+.entry .actions { display: flex; gap: 6px; align-items: flex-start; flex-wrap: wrap; justify-content: flex-end; }
+.entry .actions select { font: inherit; font-size: 12.5px; color: var(--text); background: var(--field);
+  border: 1px solid var(--line); border-radius: 8px; padding: 3px 6px; cursor: pointer; }
+.entry .actions select:disabled { opacity: 0.5; cursor: default; }
 .entry audio { grid-column: 1 / -1; width: 100%; height: 36px; margin-top: 4px; }
 .empty { color: var(--muted); font-size: 14px; }
 footer { font-size: 12px; color: var(--muted); padding: 0 4px; overflow-wrap: anywhere; }
@@ -1915,6 +2025,25 @@ function renderHistory() {
       copy.addEventListener('click', () => copyText(entry.text));
       actions.append(copy);
     }
+    if (entry.wav || entry.text != null) {
+      const regen = el('select', {className: 'regen', disabled: busyNow,
+        title: entry.wav ? 'Transcribe the recording again with the current Whisper settings, then optionally polish it'
+          : 'Recording is gone: polish the saved transcript again'});
+      regen.append(el('option', {value: '', textContent: 'Regenerate…'}),
+        el('option', {value: 'none', textContent: entry.wav ? 'Without LLM' : 'Raw (undo polish)'}),
+        el('option', {value: 'ollama', textContent: 'With Ollama'}),
+        el('option', {value: 'claude', textContent: 'With Claude'}));
+      regen.addEventListener('change', async () => {
+        const provider = regen.value;
+        regen.value = '';
+        if (!provider) return;
+        try {
+          toast((await api('/api/history/regenerate', {ts: entry.text != null ? entry.ts : null,
+            wav: entry.wav || null, provider})).message);
+        } catch (e) { toast(e.message, true); }
+      });
+      actions.append(regen);
+    }
     if (entry.wav) {
       const play = el('button', {className: 'small', textContent: 'Play'});
       play.addEventListener('click', () => playRecording(entry, row, play));
@@ -1959,10 +2088,13 @@ function renderBars(recording, level) {
 }
 
 let recordingSince = 0;
+let busyNow = false;  // recording or transcribing: no regenerating meanwhile
 function renderStatus(st) {
   const record = $('record'), message = $('message'), pill = $('pill');
   const busy = st.state === 'processing' || st.state === 'pasting';
   const recording = st.state === 'recording';
+  busyNow = busy || recording;
+  for (const regen of document.querySelectorAll('select.regen')) regen.disabled = busyNow;
   if (recording && !recordingSince) recordingSince = Date.now();
   if (!recording) recordingSince = 0;
   record.disabled = busy;
